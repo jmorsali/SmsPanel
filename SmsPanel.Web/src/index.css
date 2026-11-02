@@ -1,0 +1,4 @@
+@font-face{font-family:Dana;src:url('/fonts/Dana-FaNum-Regular.ttf') format('truetype');font-weight:400;font-display:swap}
+@font-face{font-family:Dana;src:url('/fonts/Dana-FaNum-DemiBold.ttf') format('truetype');font-weight:600;font-display:swap}
+@font-face{font-family:Dana;src:url('/fonts/Dana-FaNum-ExtraBold.ttf') format('truetype');font-weight:800;font-display:swap}
+:root{font-family:Dana,Tahoma,Arial,sans-serif;color:#1e1e1e;background:#eef0f3;font-synthesis:none;text-rendering:optimizeLegibility;--blue:#7a3b4d;--blue-dark:#592b38;--blue-light:#f5eff1;--ink:#1e1e1e;--muted:#545454;--line:#dfdfdf;--surface:#fff}*{box-sizing:border-box}html,body,#root{min-width:0;width:100%;overflow-x:hidden}body{margin:0;background:#eef0f3;color:var(--ink);font-size:14px;direction:rtl}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}

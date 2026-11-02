@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SmsPanel.Api/SmsPanel.Api.csproj" />
+  <Project Path="SmsPanel.Tests/SmsPanel.Tests.csproj" />
+</Solution>
