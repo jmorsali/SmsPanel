@@ -53,7 +53,9 @@ public sealed class MerchantImportWorker(IServiceScopeFactory scopes, IWebHostEn
                 var row = sheet.Row(rowNumber); var terminal = Cell(row, headers, "پایانه"); var nationalId = Cell(row, headers, "شناسه ملی"); var name = Cell(row, headers, "نام پذیرنده");
                 if (string.IsNullOrWhiteSpace(terminal) || string.IsNullOrWhiteSpace(nationalId) || string.IsNullOrWhiteSpace(name)) { batch.InvalidRows++; batch.ProcessedRows++; continue; }
                 if (!seen.Add(terminal) || await db.Merchants.AnyAsync(x => x.TerminalNumber == terminal, token)) { batch.DuplicateRows++; batch.ProcessedRows++; continue; }
-                var rawMobile = Cell(row, headers, "شماره موبایل"); string? mobile = null;
+                var rawMobile = Cell(row, headers, "موبایل");
+                if (string.IsNullOrWhiteSpace(rawMobile)) rawMobile = Cell(row, headers, "شماره موبایل");
+                string? mobile = null;
                 if (!string.IsNullOrWhiteSpace(rawMobile)) { try { mobile = mobiles.Normalize(rawMobile); } catch (ArgumentException) { batch.InvalidRows++; } }
                 var person = db.People.Local.SingleOrDefault(x => x.NationalCode == nationalId) ?? await db.People.SingleOrDefaultAsync(x => x.NationalCode == nationalId, token);
                 if (person is null && mobile is not null) { person = new Person { NationalCode = nationalId, FirstName = name, LastName = string.Empty, Mobile = mobile, CurrentIban = Cell(row, headers, "شبا"), SourceImportBatchId = batch.Id }; db.People.Add(person); }

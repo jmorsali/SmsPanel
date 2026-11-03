@@ -34,9 +34,11 @@ public sealed class OutboundDispatchWorker(IServiceScopeFactory scopes, IFarapay
             {
                 var response = await client.SendAsync([mobile], row.RenderedText, token);
                 row.ProviderReference = response.Value;
-                row.Status = response.IsSuccess ? OutboundStatus.Sent : row.AttemptCount >= 5 ? OutboundStatus.Failed : OutboundStatus.Pending;
+                row.Status = response.IsSuccess ? OutboundStatus.Sent : OutboundStatus.Failed;
                 row.SentAtUtc = response.IsSuccess ? DateTimeOffset.UtcNow : null;
-                row.LastError = response.IsSuccess ? null : response.StrRetStatus;
+                row.LastError = response.IsSuccess ? null : response.Value == "7"
+                    ? "متن پیام توسط فیلتر سرویس رد شد."
+                    : response.StrRetStatus ?? $"خطای سرویس پیامک ({response.Value})";
             }
             catch (Exception ex)
             {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
-import { isValidJalaaliDate, toGregorian } from "jalaali-js";
+import { isValidJalaaliDate, toGregorian, toJalaali } from "jalaali-js";
 import "./App.css";
 
 type Page =
@@ -8,6 +8,7 @@ type Page =
   | "imports"
   | "merchants"
   | "send"
+  | "campaigns"
   | "jobs"
   | "inbox"
   | "issues"
@@ -56,6 +57,19 @@ type CampaignJob = {
   processing: number;
   sent: number;
   failed: number;
+};
+type CampaignSummary = {
+  id: number;
+  name: string;
+  messageTemplate: string;
+  confirmationEnabled: boolean;
+  confirmationTemplate?: string;
+  status: "Draft" | "Active" | "Closed";
+  startsAtUtc: string;
+  endsAtUtc?: string;
+  recipientCount: number;
+  sentCount: number;
+  failedCount: number;
 };
 type Inbound = {
   id: number;
@@ -137,9 +151,19 @@ const jalaliDeadline = (date: string, time: string) => {
   const g = toGregorian(parts[0], parts[1], parts[2]);
   return new Date(g.gy, g.gm - 1, g.gd, clock[0], clock[1]).toISOString();
 };
+const jalaliParts = (value?: string) => {
+  if (!value) return { date: "", time: "" };
+  const source = new Date(value);
+  const j = toJalaali(source.getFullYear(), source.getMonth() + 1, source.getDate());
+  return {
+    date: `${j.jy}/${String(j.jm).padStart(2, "0")}/${String(j.jd).padStart(2, "0")}`,
+    time: `${String(source.getHours()).padStart(2, "0")}:${String(source.getMinutes()).padStart(2, "0")}`,
+  };
+};
 
 function App() {
   const [page, setPage] = useState<Page>("dashboard");
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [stats, setStats] = useState(emptyDashboard);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [online, setOnline] = useState(false);
@@ -202,9 +226,13 @@ function App() {
       </aside>
       <section className="main-panel">
         <header className="app-header">
-          <div className="mobile-brand">
-            <Brand compact />
-          </div>
+          <button
+            className="mobile-menu-button"
+            onClick={() => setMobileMenuOpen(true)}
+            aria-label="باز کردن منوی اصلی"
+          >
+            ☰
+          </button>
           <div className="header-title">
             <b>
               {
@@ -213,6 +241,7 @@ function App() {
                   imports: "ورود اطلاعات",
                   merchants: "پذیرندگان",
                   send: "ارسال پیامک",
+                  campaigns: "مدیریت کمپین‌ها",
                   jobs: "روند ارسال",
                   inbox: "پیام‌های دریافتی",
                   issues: "مغایرت‌ها",
@@ -236,19 +265,48 @@ function App() {
               peopleCount={stats.peopleCount}
               onCreated={() => {
                 refresh();
-                setPage("jobs");
+                setPage("campaigns");
               }}
             />
           )}{" "}
+          {page === "campaigns" && <CampaignsPage />}{" "}
           {page === "jobs" && <JobsPage />} {page === "inbox" && <InboxPage />}{" "}
           {page === "issues" && <IssuesPage issues={issues} />}{" "}
           {page === "users" && user.isAdmin && <UsersPage />}{" "}
           {page === "settings" && <SettingsPage />}
         </div>
       </section>
-      <div className="bottom-nav">
-        <Nav page={page} setPage={setPage} isAdmin={user.isAdmin} />
-      </div>
+      {mobileMenuOpen && (
+        <>
+          <button
+            className="mobile-menu-backdrop"
+            onClick={() => setMobileMenuOpen(false)}
+            aria-label="بستن منو"
+          />
+          <aside className="mobile-menu" aria-label="منوی اصلی موبایل">
+            <div className="mobile-menu-head">
+              <Brand />
+              <button onClick={() => setMobileMenuOpen(false)} aria-label="بستن منو">×</button>
+            </div>
+            <p className="side-caption">مدیریت سامانه</p>
+            <Nav
+              page={page}
+              setPage={(nextPage) => {
+                setPage(nextPage);
+                setMobileMenuOpen(false);
+              }}
+              isAdmin={user.isAdmin}
+            />
+            <div className="sidebar-help">
+              <b>{user.displayName}</b>
+              <button onClick={logout}>خروج از سامانه</button>
+              <span className={online ? "online" : "offline"}>
+                {online ? "سرویس در دسترس است" : "اتصال برقرار نیست"}
+              </span>
+            </div>
+          </aside>
+        </>
+      )}
     </div>
   );
 }
@@ -276,7 +334,7 @@ function Nav({
   const [openGroup, setOpenGroup] = useState<"merchants" | "sms" | "system" | null>(
     ["merchants", "imports"].includes(page)
       ? "merchants"
-      : ["send", "jobs", "inbox", "issues"].includes(page)
+      : ["send", "campaigns", "jobs", "inbox", "issues"].includes(page)
         ? "sms"
         : "system",
   );
@@ -297,7 +355,7 @@ function Nav({
     <nav>
       {item("dashboard", "⌂", "نمای کلی")}
       {group("merchants", "▦", "پذیرندگان", <>{item("merchants", "⌕", "جستجو")}{item("imports", "⇧", "ورود اطلاعات پذیرندگان")}</>)}
-      {group("sms", "✉", "پیامک", <>{item("send", "＋", "ارسال جدید")}{item("jobs", "◷", "روند ارسال")}{item("inbox", "↓", "پیام‌های دریافتی")}{item("issues", "!", "مغایرت‌ها")}</>)}
+      {group("sms", "✉", "پیامک", <>{item("send", "＋", "ارسال جدید")}{item("campaigns", "▤", "مدیریت کمپین‌ها")}{item("jobs", "◷", "روند ارسال")}{item("inbox", "↓", "پیام‌های دریافتی")}{item("issues", "!", "مغایرت‌ها")}</>)}
       {group("system", "⚙", "مدیریت سیستم", <>{isAdmin && item("users", "♙", "مدیریت کاربران")}{item("settings", "•", "تنظیمات")}</>)}
     </nav>
   );
@@ -811,7 +869,7 @@ function SendPage({
               maxLength={500}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              placeholder={"سلام،\nلطفاً شماره شبای پشتیبان خود را ارسال کنید."}
+              placeholder="متن پیام یا قالب پیام"
             />
             <small>
               برای شخصی‌سازی، نشانگر را در محل دلخواه بگذارید و یک گزینه از «درج
@@ -860,7 +918,10 @@ function SendPage({
                 </button>
                 {selectedRecipients.map((person) => (
                   <span key={person.id}>
-                    {person.firstName} {person.lastName}
+                    <span className="selected-recipient-info">
+                      <b>{person.firstName} {person.lastName}</b>
+                      <small>{person.mobile}</small>
+                    </span>
                     <button
                       type="button"
                       onClick={() =>
@@ -981,7 +1042,7 @@ function SendPage({
                 : selectedRecipients.length === 0)
             }
           >
-            {busy ? "در حال ثبت…" : "ایجاد و صف‌بندی کمپین"}
+            {busy ? "در حال ثبت…" : "ذخیره در وضعیت آماده ارسال"}
           </button>
         </section>
         <aside className="card preview">
@@ -1041,7 +1102,8 @@ function SendPage({
                 value={recipientSearch}
                 onChange={(e) => setRecipientSearch(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && setRecipientQuery(recipientSearch.trim())}
-                placeholder="جست‌وجوی نام، کد ملی یا شماره موبایل"
+                placeholder="نام، کد ملی یا شماره موبایل را وارد کنید"
+                inputMode="search"
               />
               <button className="primary" type="button" onClick={() => setRecipientQuery(recipientSearch.trim())}>جستجو</button>
             </div>
@@ -1360,6 +1422,91 @@ function ImportsPage() {
   );
 }
 
+const campaignStatusLabels: Record<string, string> = {
+  Draft: "آماده ارسال",
+  Active: "در حال ارسال",
+  Closed: "پایان‌یافته",
+};
+function CampaignsPage() {
+  const [items, setItems] = useState<CampaignSummary[]>([]);
+  const [total, setTotal] = useState(0);
+  const [search, setSearch] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const [editing, setEditing] = useState<CampaignSummary | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editMessage, setEditMessage] = useState("");
+  const [editConfirmationEnabled, setEditConfirmationEnabled] = useState(false);
+  const [editConfirmation, setEditConfirmation] = useState("");
+  const [editDate, setEditDate] = useState("");
+  const [editTime, setEditTime] = useState("");
+  const [fields, setFields] = useState<TemplateField[]>([]);
+  const load = () => {
+    const query = new URLSearchParams({ pageSize: "100" });
+    if (appliedSearch) query.set("search", appliedSearch);
+    if (status) query.set("status", status);
+    fetch(`/api/campaigns?${query}`)
+      .then((r) => (r.ok ? r.json() : { items: [], total: 0 }))
+      .then((x) => { setItems(x.items); setTotal(x.total); })
+      .catch(() => setItems([]));
+  };
+  useEffect(load, [appliedSearch, status]);
+  useEffect(() => { fetch("/api/templates/fields").then((r) => r.ok ? r.json() : []).then(setFields); }, []);
+  const openEdit = (item: CampaignSummary) => {
+    const deadline = jalaliParts(item.endsAtUtc);
+    setEditing(item); setEditName(item.name); setEditMessage(item.messageTemplate);
+    setEditConfirmationEnabled(item.confirmationEnabled); setEditConfirmation(item.confirmationTemplate ?? "");
+    setEditDate(deadline.date); setEditTime(deadline.time); setError("");
+  };
+  const save = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); if (!editing) return; setError("");
+    try {
+      if ((editDate && !editTime) || (!editDate && editTime)) throw new Error("تاریخ و ساعت مهلت را با هم وارد کنید.");
+      const r = await fetch(`/api/campaigns/${editing.id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: editName, messageTemplate: editMessage, endsAtUtc: editDate ? jalaliDeadline(editDate, editTime) : null, confirmationEnabled: editConfirmationEnabled, confirmationTemplate: editConfirmationEnabled ? editConfirmation : null }),
+      });
+      if (!r.ok) { const p = await r.json().catch(() => null); throw new Error(p?.message ?? "ویرایش کمپین ناموفق بود."); }
+      setEditing(null); load();
+    } catch (x) { setError(x instanceof Error ? x.message : "خطای ناشناخته"); }
+  };
+  const start = async (item: CampaignSummary) => {
+    if (!confirm(`ارسال کمپین «${item.name}» برای ${fa(item.recipientCount)} گیرنده شروع شود؟`)) return;
+    setError("");
+    const r = await fetch(`/api/campaigns/${item.id}/start`, { method: "POST" });
+    if (!r.ok) { const p = await r.json().catch(() => null); setError(p?.message ?? "شروع ارسال ناموفق بود."); return; }
+    load();
+  };
+  return <>
+    <div className="page-title"><div><span>مدیریت ارسال</span><h1>جست‌وجو و ویرایش کمپین‌ها</h1><p>کمپین را بررسی و ویرایش کنید؛ ارسال فقط با فرمان شما شروع می‌شود.</p></div></div>
+    <section className="card campaign-filters">
+      <input value={search} onChange={(e)=>setSearch(e.target.value)} onKeyDown={(e)=>e.key==="Enter"&&setAppliedSearch(search.trim())} placeholder="جست‌وجوی عنوان یا متن کمپین" />
+      <select value={status} onChange={(e)=>setStatus(e.target.value)}><option value="">همه وضعیت‌ها</option><option value="Draft">آماده ارسال</option><option value="Active">در حال ارسال</option><option value="Closed">پایان‌یافته</option></select>
+      <button className="primary" onClick={()=>setAppliedSearch(search.trim())}>جستجو</button>
+      <span>{fa(total)} کمپین</span>
+    </section>
+    {error && <p className="form-error">{error}</p>}
+    <section className="card campaign-list">
+      {items.length===0?<div className="empty"><h3>کمپینی یافت نشد</h3></div>:items.map((x)=><article key={x.id}>
+        <div><b>{x.name}</b><small>{x.messageTemplate}</small></div>
+        <span><em className={`status status-${x.status.toLowerCase()}`}>{campaignStatusLabels[x.status]??x.status}</em><small>{fa(x.recipientCount)} گیرنده · {fa(x.sentCount)} موفق · {fa(x.failedCount)} خطا</small></span>
+        <div className="campaign-actions"><button onClick={()=>openEdit(x)} disabled={x.sentCount>0||x.status==="Closed"}>ویرایش</button>{x.status==="Draft"&&<button className="primary" onClick={()=>start(x)}>شروع ارسال</button>}</div>
+      </article>)}
+    </section>
+    {editing&&<div className="modal-backdrop"><form className="campaign-editor" onSubmit={save}>
+      <header><div><h2>ویرایش کمپین</h2><small>پس از ذخیره، کمپین در وضعیت آماده ارسال می‌ماند.</small></div><button type="button" onClick={()=>setEditing(null)}>×</button></header>
+      <label><span>عنوان کمپین</span><input required value={editName} onChange={(e)=>setEditName(e.target.value)} /></label>
+      <label><span>متن یا قالب پیام</span><textarea required maxLength={1000} value={editMessage} onChange={(e)=>setEditMessage(e.target.value)} /></label>
+      <div className="field-chips">{fields.map((f)=><button type="button" key={f.name} onClick={()=>setEditMessage((v)=>v+f.token)}>{f.label}</button>)}</div>
+      <div className="editor-deadline"><label><span>تاریخ شمسی مهلت</span><input value={editDate} onChange={(e)=>setEditDate(e.target.value)} placeholder="۱۴۰۵/۰۸/۲۰" /></label><label><span>ساعت</span><input type="time" value={editTime} onChange={(e)=>setEditTime(e.target.value)} /></label></div>
+      <label className="check"><input type="checkbox" checked={editConfirmationEnabled} onChange={(e)=>setEditConfirmationEnabled(e.target.checked)} /><span><b>ارسال پیام تأیید</b></span></label>
+      {editConfirmationEnabled&&<label><span>قالب پیام تأیید</span><textarea required value={editConfirmation} onChange={(e)=>setEditConfirmation(e.target.value)} /></label>}
+      <footer><button type="button" onClick={()=>setEditing(null)}>انصراف</button><button className="primary">ذخیره تغییرات</button></footer>
+    </form></div>}
+  </>;
+}
+
 function JobsPage() {
   const [items, setItems] = useState<CampaignJob[]>([]);
   const load = () =>
@@ -1445,8 +1592,10 @@ function InboxPage() {
   const [status, setStatus] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
   const [appliedStatus, setAppliedStatus] = useState("");
+  const [page, setPage] = useState(1);
+  const pageSize = 50;
   const load = () => {
-    const q = new URLSearchParams();
+    const q = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
     if (appliedSearch) q.set("search", appliedSearch);
     if (appliedStatus) q.set("status", appliedStatus);
     fetch(`/api/inbound-messages?${q}`)
@@ -1457,8 +1606,13 @@ function InboxPage() {
       })
       .catch(() => setItems([]));
   };
-  useEffect(() => { load(); }, [appliedSearch, appliedStatus]);
-  const searchInbox = () => { setAppliedSearch(search.trim()); setAppliedStatus(status); };
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 15000);
+    return () => clearInterval(timer);
+  }, [appliedSearch, appliedStatus, page]);
+  const searchInbox = () => { setPage(1); setAppliedSearch(search.trim()); setAppliedStatus(status); };
+  const pages = Math.max(1, Math.ceil(total / pageSize));
   return (
     <>
       <div className="page-title">
@@ -1487,6 +1641,7 @@ function InboxPage() {
           <option value="Failed">خطای پردازش</option>
         </select>
         <button className="primary" onClick={searchInbox}>جستجو</button>
+        <button onClick={load}>به‌روزرسانی نتایج</button>
         <span>{fa(total)} پیام</span>
       </section>
       <section className="card inbox-list">
@@ -1519,6 +1674,11 @@ function InboxPage() {
             </article>
           ))
         )}
+        <div className="pagination">
+          <button disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>صفحه قبل</button>
+          <span>صفحه {fa(page)} از {fa(pages)} · {fa(total)} پیام</span>
+          <button disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>صفحه بعد</button>
+        </div>
       </section>
     </>
   );
