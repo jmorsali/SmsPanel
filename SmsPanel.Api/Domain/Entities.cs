@@ -13,5 +13,5 @@ public enum CampaignStatus { Draft, Active, Closed }
 public enum OutboundStatus { Pending, Processing, Sent, Failed }
 public enum ProcessingStatus { Pending, Processed, ReconciliationRequired, Failed }
 public enum IssueStatus { Open, Resolved, Rejected }
-public enum IssueType { MobileNotFound, MobileMatchesMultiplePeople, NoIbanFound, InvalidIban, MultipleIbansFound, IbanEqualsCurrentIban, IbanUsedByAnotherPerson, MultipleDifferentReplies, RequestNotActive, RequestAmbiguous }
+public enum IssueType { MobileNotFound, MobileMatchesMultiplePeople, NoIbanFound, InvalidIban, MultipleIbansFound, IbanEqualsCurrentIban, IbanUsedByAnotherPerson, MultipleDifferentReplies, RequestNotActive, RequestAmbiguous, IncompleteIban }
 public enum ImportStatus { Queued, Validating, Importing, Completed, Failed, Invalidated }

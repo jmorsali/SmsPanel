@@ -3,11 +3,11 @@ using System.Net.Http.Json;
 using Microsoft.Extensions.Options;
 namespace SmsPanel.Api.Services;
 
-public sealed class FarapayamakOptions { public string BaseUrl { get; set; } = "https://rest.payamak-panel.com/api/SendSMS/"; public string Username { get; set; } = ""; public string Password { get; set; } = ""; public string FromNumber { get; set; } = ""; public bool PollingEnabled { get; set; } = true; public int PollingIntervalMinutes { get; set; } = 5; public int InboxPageSize { get; set; } = 100; public int SendBatchSize { get; set; } = 100; }
+public sealed class FarapayamakOptions { public string BaseUrl { get; set; } = "https://rest.payamak-panel.com/api/SendSMS/"; public string Username { get; set; } = ""; public string Password { get; set; } = ""; public string FromNumber { get; set; } = ""; public bool PollingEnabled { get; set; } = true; public int PollingIntervalMinutes { get; set; } = 1; public int InboxPageSize { get; set; } = 100; public int SendBatchSize { get; set; } = 100; }
 public sealed record ProviderResponse(string Value, int RetStatus, string? StrRetStatus) { public bool IsSuccess => RetStatus == 1; }
 public sealed record ProviderInboundMessage(string Id, string Sender, string? Receiver, string Text, DateTimeOffset ReceivedAtUtc);
 public interface IFarapayamakClient { Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token); Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token); }
-public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptions> settings, ILogger<FarapayamakClient> log) : IFarapayamakClient
+public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptions> settings, ILogger<FarapayamakClient> log, InboundTextDecoder textDecoder) : IFarapayamakClient
 {
     private readonly FarapayamakOptions o = settings.Value;
     public async Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token)
@@ -24,7 +24,7 @@ public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptio
         else if (!string.IsNullOrWhiteSpace(envelope.Response.Value)) { using var legacy = JsonDocument.Parse(envelope.Response.Value); data = legacy.RootElement.Clone(); }
         else return [];
         if (data.ValueKind != JsonValueKind.Array) return [];
-        return data.EnumerateArray().Select(x => new ProviderInboundMessage(Read(x, "MsgID", "MessageId", "Id", "MsgId"), Read(x, "Sender", "From", "Mobile"), ReadOptional(x, "Receiver", "To"), Read(x, "Body", "Text", "Message"), DateTimeOffset.TryParse(ReadOptional(x, "SendDate", "ReceiveDate", "Date", "ReceivedAt"), out var d) ? d : DateTimeOffset.UtcNow)).ToList();
+        return data.EnumerateArray().Select(x => new ProviderInboundMessage(Read(x, "MsgID", "MessageId", "Id", "MsgId"), Read(x, "Sender", "From", "Mobile"), ReadOptional(x, "Receiver", "To"), textDecoder.Decode(Read(x, "Body", "Text", "Message")), DateTimeOffset.TryParse(ReadOptional(x, "SendDate", "ReceiveDate", "Date", "ReceivedAt"), out var d) ? d : DateTimeOffset.UtcNow)).ToList();
     }
     private async Task<ProviderEnvelope> Post(string op, Dictionary<string, object> fields, CancellationToken token, bool formEncoded = false)
     {

@@ -18,8 +18,10 @@ builder.Services.AddHttpClient<IFarapayamakClient, FarapayamakClient>();
 builder.Services.AddSingleton<IbanService>();
 builder.Services.AddSingleton<MobileNormalizer>();
 builder.Services.AddSingleton<MessageTemplateRenderer>();
+builder.Services.AddSingleton<InboundTextDecoder>();
 builder.Services.AddScoped<InboundMessageProcessor>();
 builder.Services.AddHostedService<InboxPollingWorker>();
+builder.Services.AddHostedService<InboundReprocessingWorker>();
 builder.Services.AddHostedService<OutboundDispatchWorker>();
 builder.Services.AddHostedService<MerchantImportWorker>();
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(o => { o.Cookie.Name = "SmsPanel.Auth"; o.Cookie.HttpOnly = true; o.Cookie.SameSite = SameSiteMode.Strict; o.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest; o.SlidingExpiration = true; o.ExpireTimeSpan = TimeSpan.FromHours(8); o.Events.OnRedirectToLogin = c => { c.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; }; o.Events.OnRedirectToAccessDenied = c => { c.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; }; });
@@ -157,6 +159,8 @@ app.MapGet("/api/campaigns", async (string? search, CampaignStatus? status, int?
         db.OutboundMessages.Count(o => o.CampaignId == x.Id && o.Status == OutboundStatus.Failed))).ToListAsync();
     return Results.Ok(new ResponseCampaignSearch(items, total, current, size));
 });
+app.MapGet("/api/campaigns/latest-start", async (SmsDbContext db, CancellationToken token) =>
+    Results.Ok(new ResponseLatestCampaignStart(await db.Campaigns.AsNoTracking().Where(x => x.Status != CampaignStatus.Draft).OrderByDescending(x => x.Id).Select(x => (DateTimeOffset?)x.StartsAtUtc).FirstOrDefaultAsync(token))));
 app.MapPatch("/api/campaigns/{id:long}", async (long id, RequestUpdateCampaign request, SmsDbContext db, MessageTemplateRenderer renderer, CancellationToken token) =>
 {
     if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.MessageTemplate)) return Results.BadRequest(new { message = "عنوان و متن کمپین الزامی است." });
@@ -186,14 +190,36 @@ app.MapPost("/api/campaigns/{id:long}/start", async (long id, SmsDbContext db, C
 });
 app.MapGet("/api/reconciliation-issues", async (SmsDbContext db) => Results.Ok(await db.ReconciliationIssues.AsNoTracking().OrderByDescending(x => x.CreatedAtUtc).Take(500).ToListAsync()));
 app.MapGet("/api/campaigns/jobs", async (SmsDbContext db) => Results.Ok(await db.Campaigns.AsNoTracking().OrderByDescending(x => x.Id).Select(x => new { x.Id, x.Name, x.Status, x.StartsAtUtc, x.EndsAtUtc, Total = db.OutboundMessages.Count(o => o.CampaignId == x.Id), Pending = db.OutboundMessages.Count(o => o.CampaignId == x.Id && o.Status == OutboundStatus.Pending), Processing = db.OutboundMessages.Count(o => o.CampaignId == x.Id && o.Status == OutboundStatus.Processing), Sent = db.OutboundMessages.Count(o => o.CampaignId == x.Id && o.Status == OutboundStatus.Sent), Failed = db.OutboundMessages.Count(o => o.CampaignId == x.Id && o.Status == OutboundStatus.Failed) }).Take(200).ToListAsync()));
-app.MapPost("/api/campaigns/{id:long}/retry-failed", async (long id, SmsDbContext db, CancellationToken token) => { var count = await db.OutboundMessages.Where(x => x.CampaignId == id && x.Status == OutboundStatus.Failed).ExecuteUpdateAsync(x => x.SetProperty(m => m.Status, OutboundStatus.Pending).SetProperty(m => m.LastError, (string?)null), token); return Results.Ok(new { count }); });
-app.MapGet("/api/inbound-messages", async (string? search, ProcessingStatus? status, int? page, int? pageSize, SmsDbContext db) =>
+app.MapGet("/api/campaigns/{id:long}/failed-messages", async (long id, int? page, int? pageSize, SmsDbContext db, CancellationToken token) =>
+{
+    if (!await db.Campaigns.AnyAsync(x => x.Id == id, token)) return Results.NotFound();
+    var query = db.OutboundMessages.AsNoTracking().Where(x => x.CampaignId == id && x.Status == OutboundStatus.Failed);
+    var current = Math.Max(page ?? 1, 1); var size = Math.Clamp(pageSize ?? 50, 10, 200); var total = await query.CountAsync(token);
+    var items = await query.OrderBy(x => x.Id).Skip((current - 1) * size).Take(size)
+        .Join(db.People.AsNoTracking(), message => message.PersonId, person => person.Id,
+            (message, person) => new ResponseFailedOutboundMessage(message.Id, $"{person.FirstName} {person.LastName}".Trim(), person.Mobile, message.AttemptCount, message.LastError ?? "علت خطا ثبت نشده است."))
+        .ToListAsync(token);
+    return Results.Ok(new ResponseFailedOutboundMessageSearch(items, total, current, size));
+});
+app.MapPost("/api/campaigns/{id:long}/retry-failed", async (long id, SmsDbContext db, CancellationToken token) =>
+{
+    var campaign = await db.Campaigns.SingleOrDefaultAsync(x => x.Id == id, token);
+    if (campaign is null) return Results.NotFound();
+    var count = await db.OutboundMessages.Where(x => x.CampaignId == id && x.Status == OutboundStatus.Failed)
+        .ExecuteUpdateAsync(x => x.SetProperty(m => m.Status, OutboundStatus.Pending).SetProperty(m => m.LastError, (string?)null), token);
+    if (count > 0) { campaign.Status = CampaignStatus.Active; await db.SaveChangesAsync(token); }
+    return Results.Ok(new { count });
+});
+app.MapGet("/api/inbound-messages", async (string? search, ProcessingStatus? status, IssueType? issueType, DateTimeOffset? fromUtc, int? page, int? pageSize, SmsDbContext db, IbanService ibans) =>
 {
     var query = db.InboundMessages.AsNoTracking().AsQueryable();
     if (status.HasValue) query = query.Where(x => x.ProcessingStatus == status.Value);
+    if (issueType.HasValue) query = query.Where(x => db.ReconciliationIssues.Any(r => r.InboundMessageId == x.Id && r.Status == IssueStatus.Open && r.IssueType == issueType.Value));
+    if (fromUtc.HasValue) query = query.Where(x => x.ReceivedAtUtc >= fromUtc.Value);
     if (!string.IsNullOrWhiteSpace(search)) { var term = search.Trim(); query = query.Where(x => x.SenderMobile.Contains(term) || x.RawText.Contains(term) || x.ProviderMessageId.Contains(term)); }
     var size = Math.Clamp(pageSize ?? 50, 10, 200); var current = Math.Max(page ?? 1, 1); var total = await query.CountAsync();
-    var items = await query.OrderByDescending(x => x.ReceivedAtUtc).Skip((current - 1) * size).Take(size).Select(x => new { x.Id, x.ProviderMessageId, x.SenderMobile, x.RawText, x.ReceivedAtUtc, x.ProcessingStatus, x.LastError, Iban = db.SecondaryBankAccounts.Where(a => a.InboundMessageId == x.Id).Select(a => a.Iban).FirstOrDefault() }).ToListAsync();
+    var rows = await query.OrderByDescending(x => x.ReceivedAtUtc).Skip((current - 1) * size).Take(size).Select(x => new { x.Id, x.ProviderMessageId, x.SenderMobile, x.RawText, x.ReceivedAtUtc, x.ProcessingStatus, x.LastError, RegisteredIban = db.SecondaryBankAccounts.Where(a => a.InboundMessageId == x.Id).Select(a => a.Iban).FirstOrDefault(), IssueIban = db.ReconciliationIssues.Where(r => r.InboundMessageId == x.Id && r.ExtractedIban != null).OrderByDescending(r => r.Id).Select(r => r.ExtractedIban).FirstOrDefault(), IssueType = db.ReconciliationIssues.Where(r => r.InboundMessageId == x.Id && r.Status == IssueStatus.Open).OrderByDescending(r => r.Id).Select(r => (IssueType?)r.IssueType).FirstOrDefault() }).ToListAsync();
+    var items = rows.Select(x => { var extracted = ibans.Extract(x.RawText).Concat(ibans.ExtractCorrectable(x.RawText)).Distinct(StringComparer.OrdinalIgnoreCase).ToList(); var iban = x.RegisteredIban ?? x.IssueIban ?? (extracted.Count == 1 ? extracted[0] : null); return new ResponseInboundMessage(x.Id, x.ProviderMessageId, x.SenderMobile, x.RawText, x.ReceivedAtUtc, x.ProcessingStatus, x.LastError, iban, x.IssueType); }).ToList();
     return Results.Ok(new { items, total, page = current, pageSize = size });
 });
 app.MapPost("/api/inbound-messages/{id:long}/retry", async (long id, SmsDbContext db, InboundMessageProcessor processor, CancellationToken token) =>
@@ -202,21 +228,60 @@ app.MapPost("/api/inbound-messages/{id:long}/retry", async (long id, SmsDbContex
     await db.ReconciliationIssues.Where(x => x.InboundMessageId == id).ExecuteDeleteAsync(token); message.ProcessingStatus = ProcessingStatus.Pending; message.LastError = null; await db.SaveChangesAsync(token);
     await processor.ProcessAsync(message, token); return Results.Ok(new { message.Id, message.ProcessingStatus });
 });
+app.MapPost("/api/inbound-messages/reprocess-no-iban", async (SmsDbContext db, InboundMessageProcessor processor, CancellationToken token) =>
+{
+    var messageIds = await db.ReconciliationIssues.AsNoTracking()
+        .Where(x => x.Status == IssueStatus.Open && (x.IssueType == IssueType.NoIbanFound || x.IssueType == IssueType.MultipleIbansFound))
+        .Select(x => x.InboundMessageId).Distinct().ToListAsync(token);
+    var processed = 0; var stillNeedsReview = 0;
+    foreach (var id in messageIds)
+    {
+        var message = await db.InboundMessages.SingleOrDefaultAsync(x => x.Id == id, token);
+        if (message is null) continue;
+        await db.ReconciliationIssues.Where(x => x.InboundMessageId == id && x.Status == IssueStatus.Open).ExecuteDeleteAsync(token);
+        message.ProcessingStatus = ProcessingStatus.Pending; message.LastError = null; await db.SaveChangesAsync(token);
+        await processor.ProcessAsync(message, token, sendConfirmation: false);
+        if (message.ProcessingStatus == ProcessingStatus.Processed) processed++; else stillNeedsReview++;
+    }
+    return Results.Ok(new ResponseReprocessInboundMessages(messageIds.Count, processed, stillNeedsReview));
+});
+app.MapGet("/api/inbound-messages/export.xlsx", async (string? search, ProcessingStatus? status, IssueType? issueType, DateTimeOffset? fromUtc, SmsDbContext db, IbanService ibans, CancellationToken token) =>
+{
+    var query = db.InboundMessages.AsNoTracking().AsQueryable();
+    if (status.HasValue) query = query.Where(x => x.ProcessingStatus == status.Value);
+    if (issueType.HasValue) query = query.Where(x => db.ReconciliationIssues.Any(r => r.InboundMessageId == x.Id && r.Status == IssueStatus.Open && r.IssueType == issueType.Value));
+    if (fromUtc.HasValue) query = query.Where(x => x.ReceivedAtUtc >= fromUtc.Value);
+    if (!string.IsNullOrWhiteSpace(search)) { var term = search.Trim(); query = query.Where(x => x.SenderMobile.Contains(term) || x.RawText.Contains(term) || x.ProviderMessageId.Contains(term)); }
+    var rows = await query.OrderByDescending(x => x.ReceivedAtUtc).Select(x => new { x.Id, x.ProviderMessageId, x.SenderMobile, x.RawText, x.ReceivedAtUtc, x.ProcessingStatus, x.LastError, RegisteredIban = db.SecondaryBankAccounts.Where(a => a.InboundMessageId == x.Id).Select(a => a.Iban).FirstOrDefault(), IssueIban = db.ReconciliationIssues.Where(r => r.InboundMessageId == x.Id && r.ExtractedIban != null).OrderByDescending(r => r.Id).Select(r => r.ExtractedIban).FirstOrDefault(), IssueType = db.ReconciliationIssues.Where(r => r.InboundMessageId == x.Id && r.Status == IssueStatus.Open).OrderByDescending(r => r.Id).Select(r => (IssueType?)r.IssueType).FirstOrDefault() }).ToListAsync(token);
+    using var workbook = new XLWorkbook(); var sheet = workbook.Worksheets.Add("پیام‌های دریافتی");
+    var headers = new[] { "شناسه ردیف", "زمان دریافت", "شماره فرستنده", "متن پیام", "وضعیت", "دلیل بررسی", "شماره شبا", "شناسه پیام سرویس" };
+    for (var column = 0; column < headers.Length; column++) sheet.Cell(1, column + 1).Value = headers[column];
+    for (var index = 0; index < rows.Count; index++)
+    {
+        var row = rows[index]; var extracted = ibans.Extract(row.RawText).Concat(ibans.ExtractCorrectable(row.RawText)).Distinct(StringComparer.OrdinalIgnoreCase).ToList(); var iban = row.RegisteredIban ?? row.IssueIban ?? (extracted.Count == 1 ? extracted[0] : null);
+        sheet.Cell(index + 2, 1).Value = row.Id; sheet.Cell(index + 2, 2).Value = row.ReceivedAtUtc.LocalDateTime; sheet.Cell(index + 2, 3).Value = row.SenderMobile; sheet.Cell(index + 2, 4).Value = row.RawText;
+        sheet.Cell(index + 2, 5).Value = row.ProcessingStatus == ProcessingStatus.Processed ? "پاسخ موفق" : row.ProcessingStatus == ProcessingStatus.ReconciliationRequired ? "نیازمند بررسی" : row.ProcessingStatus == ProcessingStatus.Pending ? "در انتظار پردازش" : "خطای پردازش";
+        sheet.Cell(index + 2, 6).Value = row.IssueType.HasValue ? IssueLabel(row.IssueType.Value) : string.Empty; sheet.Cell(index + 2, 7).Value = iban ?? string.Empty; sheet.Cell(index + 2, 8).Value = row.ProviderMessageId;
+    }
+    sheet.RightToLeft = true; sheet.Row(1).Style.Font.Bold = true; sheet.SheetView.FreezeRows(1); sheet.Columns().AdjustToContents(8, 60); using var stream = new MemoryStream(); workbook.SaveAs(stream);
+    return Results.File(stream.ToArray(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "inbound-messages.xlsx");
+});
 app.MapGet("/api/secondary-accounts/export.csv", async (SmsDbContext db) =>
 {
-    var rows = await db.SecondaryBankAccounts.AsNoTracking().Join(db.People, a => a.PersonId, p => p.Id, (a, p) => new { p.NationalCode, p.FirstName, p.LastName, p.Mobile, a.Iban, a.ReceivedAtUtc }).OrderBy(x => x.NationalCode).ToListAsync();
-    var csv = new System.Text.StringBuilder("NationalCode,FirstName,LastName,Mobile,Iban,ReceivedAtUtc\r\n"); foreach (var x in rows) csv.AppendLine(string.Join(',', new[] { x.NationalCode, x.FirstName, x.LastName, x.Mobile, x.Iban, x.ReceivedAtUtc.ToString("O") }.Select(Csv)));
+    var rows = await db.SecondaryBankAccounts.AsNoTracking().Join(db.People, a => a.PersonId, p => p.Id, (a, p) => new { a.Id, p.NationalCode, p.FirstName, p.LastName, p.Mobile, a.Iban, a.ReceivedAtUtc }).OrderBy(x => x.NationalCode).ToListAsync();
+    var csv = new System.Text.StringBuilder("RowId,NationalCode,FirstName,LastName,Mobile,Iban,ReceivedAtUtc\r\n"); foreach (var x in rows) csv.AppendLine(string.Join(',', new[] { x.Id.ToString(), x.NationalCode, x.FirstName, x.LastName, x.Mobile, x.Iban, x.ReceivedAtUtc.ToString("O") }.Select(Csv)));
     return Results.File(System.Text.Encoding.UTF8.GetPreamble().Concat(System.Text.Encoding.UTF8.GetBytes(csv.ToString())).ToArray(), "text/csv; charset=utf-8", "secondary-accounts.csv");
 });
 app.MapGet("/api/secondary-accounts/export.xlsx", async (SmsDbContext db) =>
 {
-    var rows = await db.SecondaryBankAccounts.AsNoTracking().Join(db.People, a => a.PersonId, p => p.Id, (a, p) => new { p.NationalCode, p.FirstName, p.LastName, p.Mobile, a.Iban, a.ReceivedAtUtc }).OrderBy(x => x.NationalCode).ToListAsync();
-    using var workbook = new XLWorkbook(); var sheet = workbook.Worksheets.Add("شماره شباها"); var headers = new[] { "کد ملی", "نام", "نام خانوادگی", "شماره موبایل", "شماره شبا", "زمان دریافت" }; for (var i = 0; i < headers.Length; i++) sheet.Cell(1, i + 1).Value = headers[i];
-    for (var i = 0; i < rows.Count; i++) { var x = rows[i]; sheet.Cell(i + 2, 1).Value = x.NationalCode; sheet.Cell(i + 2, 2).Value = x.FirstName; sheet.Cell(i + 2, 3).Value = x.LastName; sheet.Cell(i + 2, 4).Value = x.Mobile; sheet.Cell(i + 2, 5).Value = x.Iban; sheet.Cell(i + 2, 6).Value = x.ReceivedAtUtc.LocalDateTime; }
+    var rows = await db.SecondaryBankAccounts.AsNoTracking().Join(db.People, a => a.PersonId, p => p.Id, (a, p) => new { a.Id, p.NationalCode, p.FirstName, p.LastName, p.Mobile, a.Iban, a.ReceivedAtUtc }).OrderBy(x => x.NationalCode).ToListAsync();
+    using var workbook = new XLWorkbook(); var sheet = workbook.Worksheets.Add("شماره شباها"); var headers = new[] { "شناسه ردیف", "کد ملی", "نام", "نام خانوادگی", "شماره موبایل", "شماره شبا", "زمان دریافت" }; for (var i = 0; i < headers.Length; i++) sheet.Cell(1, i + 1).Value = headers[i];
+    for (var i = 0; i < rows.Count; i++) { var x = rows[i]; sheet.Cell(i + 2, 1).Value = x.Id; sheet.Cell(i + 2, 2).Value = x.NationalCode; sheet.Cell(i + 2, 3).Value = x.FirstName; sheet.Cell(i + 2, 4).Value = x.LastName; sheet.Cell(i + 2, 5).Value = x.Mobile; sheet.Cell(i + 2, 6).Value = x.Iban; sheet.Cell(i + 2, 7).Value = x.ReceivedAtUtc.LocalDateTime; }
     sheet.RightToLeft = true; sheet.Row(1).Style.Font.Bold = true; sheet.Columns().AdjustToContents(); using var stream = new MemoryStream(); workbook.SaveAs(stream); return Results.File(stream.ToArray(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "secondary-accounts.xlsx");
 });
 app.Run();
 static string Csv(string value) => $"\"{value.Replace("\"", "\"\"")}\"";
+static string IssueLabel(IssueType type) => type switch { IssueType.MobileNotFound => "شماره ناشناس", IssueType.MobileMatchesMultiplePeople => "موبایل تکراری", IssueType.NoIbanFound => "شبا پیدا نشد", IssueType.InvalidIban => "شبای نامعتبر", IssueType.MultipleIbansFound => "چند شبا", IssueType.IbanEqualsCurrentIban => "برابر حساب فعلی", IssueType.IbanUsedByAnotherPerson => "شبای متعلق به شخص دیگر", IssueType.MultipleDifferentReplies => "پاسخ متفاوت", IssueType.RequestNotActive => "درخواست غیرفعال", IssueType.RequestAmbiguous => "کمپین مبهم", IssueType.IncompleteIban => "شماره شبا ناقص است", _ => type.ToString() };
 static string? ValidateUser(RequestCreateUser request) { if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.DisplayName)) return "نام کاربری و نام نمایشی الزامی است."; if (request.Password.Length < 8) return "رمز عبور باید حداقل ۸ نویسه باشد."; return null; }
 static async Task SignIn(HttpContext http, AppUser user) { var claims = new List<Claim> { new(ClaimTypes.NameIdentifier, user.Id.ToString()), new(ClaimTypes.Name, user.Username), new("display_name", user.DisplayName), new(ClaimTypes.Role, user.IsAdmin ? "Admin" : "User") }; await http.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme))); }
 public sealed record PersonInput(string NationalCode, string FirstName, string LastName, string Mobile, string? CurrentIban);
@@ -224,8 +289,13 @@ public sealed record RequestCreateCampaign(string Name, string MessageTemplate, 
 public sealed record RequestUpdateCampaign(string Name, string MessageTemplate, DateTimeOffset? EndsAtUtc = null, bool ConfirmationEnabled = false, string? ConfirmationTemplate = null);
 public sealed record ResponseCampaignSummary(long Id, string Name, string MessageTemplate, bool ConfirmationEnabled, string? ConfirmationTemplate, CampaignStatus Status, DateTimeOffset StartsAtUtc, DateTimeOffset? EndsAtUtc, int RecipientCount, int SentCount, int FailedCount);
 public sealed record ResponseCampaignSearch(IReadOnlyList<ResponseCampaignSummary> Items, int Total, int Page, int PageSize);
+public sealed record ResponseLatestCampaignStart(DateTimeOffset? StartsAtUtc);
 public sealed record ResponseUpdateCampaign(long Id, CampaignStatus Status);
 public sealed record ResponseStartCampaign(long Id, CampaignStatus Status);
+public sealed record ResponseReprocessInboundMessages(int Examined, int Processed, int StillNeedsReview);
+public sealed record ResponseFailedOutboundMessage(long Id, string FullName, string Mobile, int AttemptCount, string Error);
+public sealed record ResponseFailedOutboundMessageSearch(IReadOnlyList<ResponseFailedOutboundMessage> Items, int Total, int Page, int PageSize);
+public sealed record ResponseInboundMessage(long Id, string ProviderMessageId, string SenderMobile, string RawText, DateTimeOffset ReceivedAtUtc, ProcessingStatus ProcessingStatus, string? LastError, string? Iban, IssueType? IssueType);
 public sealed record ResponseDashboard(int PeopleCount, int ActiveCampaignCount, int SentCount, int ReceivedIbanCount, int OpenIssueCount);
 public sealed record RequestLogin(string Username, string Password);
 public sealed record RequestCreateUser(string Username, string DisplayName, string Password, bool IsAdmin = false);
