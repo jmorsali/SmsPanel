@@ -19,8 +19,14 @@ sequenceDiagram
         Processor->>Processor: Extract and validate one IBAN
         alt Valid unique backup IBAN
             Processor->>DB: Save secondary account and mark Processed
+            opt Success confirmation enabled
+                Processor->>SMS: Send rendered confirmation
+            end
         else Validation or matching failure
             Processor->>DB: Save reconciliation issue
+            opt Invalid-reply message enabled and campaign/person identified
+                Processor->>SMS: Send rendered invalid-reply guidance
+            end
         end
     end
 ```
@@ -31,6 +37,10 @@ sequenceDiagram
 - Exactly one person must match the sender mobile.
 - The campaign is the latest successful outbound message sent before the inbound reply and within the campaign response window.
 - The reply must contain exactly one checksum-valid IBAN.
+- Canonical `IR` IBANs, 24 contiguous digits, supported grouped formats, and Persian or Arabic digits are normalized before validation.
+- A 25-digit candidate is accepted only when deleting one digit produces exactly one checksum-valid IBAN.
+- A 23-digit candidate is accepted only when inserting one digit in all possible positions produces exactly one checksum-valid IBAN. Ambiguous candidates remain under review.
+- Supported grouped bodies include `4-4-4-4-8` hyphen groups and four 6-digit groups separated by slash, hyphen, or dash.
 - The backup IBAN must differ from the person's current IBAN and must not belong to another person in the collected data.
 - Ownership verification is intentionally not performed.
 
@@ -38,10 +48,14 @@ sequenceDiagram
 
 - Successful processing creates one secondary account per person and campaign.
 - Optional confirmation SMS is sent only after a successful record and when enabled on the campaign.
+- Optional invalid-reply SMS is sent after the reconciliation issue is committed, only when both the person and campaign are known.
 - Ambiguous, missing, invalid, duplicate, or inactive-request replies create a reconciliation issue.
 - The UI polls its database view every 15 seconds and supports explicit refresh, filtering, and pagination.
+- Inbound search and inbound/secondary-account exports can be restricted to a campaign. Campaign association comes from either the successful secondary account or the reconciliation issue.
+- For `MultipleDifferentReplies`, the inbox displays up to ten earlier replies from the same sender and campaign, newest first.
 
 ## Known gaps
 
 - Provider timestamps are accepted as supplied; clock or timezone inconsistencies can affect temporal matching.
 - Polling is used because no stable public webhook endpoint is available.
+- Automated confirmation and invalid-reply provider calls are made after the database transaction; a provider failure does not roll back the successfully classified inbound message.

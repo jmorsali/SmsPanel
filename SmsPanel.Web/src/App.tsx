@@ -14,6 +14,14 @@ type Page =
   | "issues"
   | "users"
   | "settings";
+type NavIconName = "dashboard" | "merchants" | "search" | "upload" | "sms" | "send" | "campaigns" | "jobs" | "inbox" | "issues" | "system" | "users" | "settings" | "chevron";
+const pagePaths: Record<Page, string> = {
+  dashboard: "/", merchants: "/merchants", imports: "/merchants/import",
+  send: "/sms/send", campaigns: "/sms/campaigns", jobs: "/sms/jobs",
+  inbox: "/sms/inbox", issues: "/sms/issues", users: "/system/users", settings: "/system/settings",
+};
+const pagesByPath = Object.fromEntries(Object.entries(pagePaths).map(([page, path]) => [path, page as Page])) as Record<string, Page>;
+const pageFromLocation = (): Page => pagesByPath[window.location.pathname.replace(/\/+$/, "") || "/"] ?? "dashboard";
 type Dashboard = {
   peopleCount: number;
   activeCampaignCount: number;
@@ -65,6 +73,8 @@ type CampaignSummary = {
   messageTemplate: string;
   confirmationEnabled: boolean;
   confirmationTemplate?: string;
+  invalidReplyEnabled: boolean;
+  invalidReplyTemplate?: string;
   status: "Draft" | "Active" | "Closed";
   startsAtUtc: string;
   endsAtUtc?: string;
@@ -72,7 +82,8 @@ type CampaignSummary = {
   sentCount: number;
   failedCount: number;
 };
-type CampaignSeed = Pick<CampaignSummary, "name" | "messageTemplate" | "confirmationEnabled" | "confirmationTemplate">;
+type CampaignSeed = Pick<CampaignSummary, "name" | "messageTemplate" | "confirmationEnabled" | "confirmationTemplate" | "invalidReplyEnabled" | "invalidReplyTemplate">;
+type RecipientStatusCount = { status: string; count: number };
 type Inbound = {
   id: number;
   providerMessageId: string;
@@ -83,7 +94,14 @@ type Inbound = {
   lastError?: string;
   iban?: string;
   issueType?: string;
+  fullName?: string;
+  currentIban?: string;
+  currentBank?: string;
+  campaignId?: number;
+  campaignName?: string;
+  previousReplies: PreviousInboundReply[];
 };
+type PreviousInboundReply = { id: number; rawText: string; receivedAtUtc: string; iban?: string };
 type CurrentUser = { username: string; displayName: string; isAdmin: boolean };
 type ManagedUser = {
   id: number;
@@ -134,6 +152,19 @@ const issueLabels: Record<string, string> = {
   RequestAmbiguous: "کمپین مبهم",
   IncompleteIban: "شماره شبا ناقص است",
 };
+const recipientStatusLabels: Record<string, string> = {
+  Successful: "پاسخ موفق و شبای ثبت‌شده",
+  NoReply: "بدون پاسخ",
+  NoIbanFound: "پیام نامعتبر یا بدون شبا",
+  InvalidIban: "شبای نامعتبر",
+  MultipleIbansFound: "بیش از یک شبا در پیام",
+  IbanEqualsCurrentIban: "شبا برابر حساب فعلی",
+  IbanUsedByAnotherPerson: "شبای متعلق به شخص دیگر",
+  MultipleDifferentReplies: "پاسخ متفاوت با پاسخ قبلی",
+  RequestNotActive: "درخواست غیرفعال",
+  RequestAmbiguous: "کمپین مبهم",
+  IncompleteIban: "شماره شبای ناقص",
+};
 const fa = (value: number) => value.toLocaleString("fa-IR");
 const latinDigits = (value: string) =>
   value
@@ -166,7 +197,7 @@ const jalaliParts = (value?: string) => {
 };
 
 function App() {
-  const [page, setPage] = useState<Page>("dashboard");
+  const [page, setPage] = useState<Page>(pageFromLocation);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [stats, setStats] = useState(emptyDashboard);
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -178,7 +209,7 @@ function App() {
   const refresh = () =>
     Promise.all([
       fetch("/health"),
-      fetch("/api/dashboard"),
+      fetch("/api/dashboard", { cache: "no-store" }),
       fetch("/api/reconciliation-issues"),
     ])
       .then(async ([h, d, i]) => {
@@ -198,6 +229,19 @@ function App() {
       })
       .catch(() => setAuthReady(true));
   }, []);
+  useEffect(() => {
+    const onPopState = () => setPage(pageFromLocation());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  useEffect(() => {
+    if (user && page === "dashboard") refresh();
+  }, [page, user]);
+  const navigate = (nextPage: Page) => {
+    const path = pagePaths[nextPage];
+    if (window.location.pathname !== path) window.history.pushState({}, "", path);
+    setPage(nextPage);
+  };
   if (!authReady)
     return <div className="auth-loading">در حال آماده‌سازی سامانه…</div>;
   if (!user)
@@ -220,7 +264,7 @@ function App() {
       <aside className="sidebar">
         <Brand />
         <p className="side-caption">مدیریت سامانه</p>
-        <Nav page={page} setPage={setPage} isAdmin={user.isAdmin} />
+        <Nav page={page} setPage={navigate} isAdmin={user.isAdmin} />
         <div className="sidebar-help">
           <b>{user.displayName}</b>
           <button onClick={logout}>خروج از سامانه</button>
@@ -261,7 +305,7 @@ function App() {
         </header>
         <div className="main-inner">
           {page === "dashboard" && (
-            <DashboardPage stats={stats} goSend={() => setPage("send")} />
+            <DashboardPage stats={stats} goSend={() => navigate("send")} />
           )}{" "}
           {page === "imports" && <ImportsPage />}{" "}
           {page === "merchants" && <MerchantsPage />}{" "}
@@ -272,11 +316,11 @@ function App() {
               onCreated={() => {
                 setCampaignSeed(null);
                 refresh();
-                setPage("campaigns");
+                navigate("campaigns");
               }}
             />
           )}{" "}
-          {page === "campaigns" && <CampaignsPage onReuse={(campaign) => { setCampaignSeed(campaign); setPage("send"); }} />}{" "}
+          {page === "campaigns" && <CampaignsPage onReuse={(campaign) => { setCampaignSeed(campaign); navigate("send"); }} />}{" "}
           {page === "jobs" && <JobsPage />} {page === "inbox" && <InboxPage />}{" "}
           {page === "issues" && <IssuesPage issues={issues} />}{" "}
           {page === "users" && user.isAdmin && <UsersPage />}{" "}
@@ -299,7 +343,7 @@ function App() {
             <Nav
               page={page}
               setPage={(nextPage) => {
-                setPage(nextPage);
+                navigate(nextPage);
                 setMobileMenuOpen(false);
               }}
               isAdmin={user.isAdmin}
@@ -343,29 +387,52 @@ function Nav({
       ? "merchants"
       : ["send", "campaigns", "jobs", "inbox", "issues"].includes(page)
         ? "sms"
-        : "system",
+        : ["users", "settings"].includes(page) ? "system" : null,
   );
-  const item = (id: Page, icon: string, label: string) => (
-    <button key={id} className={`nav-child ${page === id ? "active" : ""}`} onClick={() => setPage(id)}>
-      <i>{icon}</i><span>{label}</span>
-    </button>
+  const item = (id: Page, icon: NavIconName, label: string) => (
+    <a key={id} href={pagePaths[id]} className={`nav-child ${page === id ? "active" : ""}`} onClick={(event) => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      setPage(id);
+    }}>
+      <i><NavIcon name={icon} /></i><span>{label}</span>
+    </a>
   );
-  const group = (id: "merchants" | "sms" | "system", icon: string, label: string, children: ReactNode) => (
+  const group = (id: "merchants" | "sms" | "system", icon: NavIconName, label: string, children: ReactNode) => (
     <div className={`nav-group ${openGroup === id ? "open" : ""}`}>
       <button className="nav-group-title" onClick={() => setOpenGroup(openGroup === id ? null : id)}>
-        <i>{icon}</i><span>{label}</span><b>{openGroup === id ? "⌃" : "⌄"}</b>
+        <i><NavIcon name={icon} /></i><span>{label}</span><b><NavIcon name="chevron" /></b>
       </button>
       {openGroup === id && <div className="nav-children">{children}</div>}
     </div>
   );
   return (
     <nav>
-      {item("dashboard", "⌂", "نمای کلی")}
-      {group("merchants", "▦", "پذیرندگان", <>{item("merchants", "⌕", "جستجو")}{item("imports", "⇧", "ورود اطلاعات پذیرندگان")}</>)}
-      {group("sms", "✉", "پیامک", <>{item("send", "＋", "ارسال جدید")}{item("campaigns", "▤", "مدیریت کمپین‌ها")}{item("jobs", "◷", "روند ارسال")}{item("inbox", "↓", "پیام‌های دریافتی")}{item("issues", "!", "مغایرت‌ها")}</>)}
-      {group("system", "⚙", "مدیریت سیستم", <>{isAdmin && item("users", "♙", "مدیریت کاربران")}{item("settings", "•", "تنظیمات")}</>)}
+      {item("dashboard", "dashboard", "نمای کلی")}
+      {group("merchants", "merchants", "پذیرندگان", <>{item("merchants", "search", "جستجو")}{item("imports", "upload", "ورود اطلاعات پذیرندگان")}</>)}
+      {group("sms", "sms", "پیامک", <>{item("send", "send", "ارسال جدید")}{item("campaigns", "campaigns", "مدیریت کمپین‌ها")}{item("jobs", "jobs", "روند ارسال")}{item("inbox", "inbox", "پیام‌های دریافتی")}{item("issues", "issues", "مغایرت‌ها")}</>)}
+      {group("system", "system", "مدیریت سیستم", <>{isAdmin && item("users", "users", "مدیریت کاربران")}{item("settings", "settings", "تنظیمات")}</>)}
     </nav>
   );
+}
+function NavIcon({ name }: { name: NavIconName }) {
+  const paths: Record<NavIconName, ReactNode> = {
+    dashboard: <><rect x="3" y="3" width="7" height="8" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="3" y="15" width="7" height="6" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/></>,
+    merchants: <><path d="M3 10h18"/><path d="m5 10 2-6h10l2 6"/><path d="M5 10v10h14V10"/><path d="M9 20v-5h6v5"/></>,
+    search: <><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></>,
+    upload: <><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></>,
+    sms: <><path d="M4 5h16v12H8l-4 3V5Z"/><path d="M8 9h8M8 13h5"/></>,
+    send: <><path d="m3 11 18-8-8 18-2-7-8-3Z"/><path d="m11 14 4-4"/></>,
+    campaigns: <><rect x="4" y="4" width="12" height="16" rx="2"/><path d="M8 9h4M8 13h4M19 8v8"/></>,
+    jobs: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></>,
+    inbox: <><path d="M4 4h16v16H4z"/><path d="M4 14h4l2 3h4l2-3h4"/><path d="M12 5v7m-3-3 3 3 3-3"/></>,
+    issues: <><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 9v4M12 17h.01"/></>,
+    system: <><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></>,
+    users: <><circle cx="9" cy="8" r="4"/><path d="M2 21v-2a5 5 0 0 1 5-5h4a5 5 0 0 1 5 5v2M17 8h5M19.5 5.5v5"/></>,
+    settings: <><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.8-1L14.4 3h-4l-.4 3.1a8 8 0 0 0-1.8 1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.8 1l.4 3.1h4l.4-3.1a8 8 0 0 0 1.8-1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1Z"/></>,
+    chevron: <path d="m7 10 5 5 5-5"/>,
+  };
+  return <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 function AuthPage({
   needsSetup,
@@ -674,8 +741,13 @@ function SendPage({
     seed?.confirmationTemplate ?? "شماره شبای پشتیبان شما با پایان {{چهار_رقم_آخر_شبای_دریافتی}} با موفقیت ثبت شد.",
   );
   const [confirmationEnabled, setConfirmationEnabled] = useState(seed?.confirmationEnabled ?? false);
-  const [recipientMode, setRecipientMode] = useState<"all" | "selected">("all");
+  const [invalidReplyEnabled, setInvalidReplyEnabled] = useState(seed?.invalidReplyEnabled ?? false);
+  const [invalidReplyMessage, setInvalidReplyMessage] = useState(seed?.invalidReplyTemplate ?? "پاسخ شما قابل ثبت نبود: {{دلیل_نامعتبر_بودن}}. لطفاً شماره شبای صحیح را دوباره ارسال کنید.");
+  const [recipientMode, setRecipientMode] = useState<"all" | "selected" | "status">("all");
   const [selectedRecipients, setSelectedRecipients] = useState<Recipient[]>([]);
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
+  const [recipientStatusCounts, setRecipientStatusCounts] = useState<RecipientStatusCount[]>([]);
+  const [statusPickerOpen, setStatusPickerOpen] = useState(false);
   const [recipientPickerOpen, setRecipientPickerOpen] = useState(false);
   const [recipientSearch, setRecipientSearch] = useState("");
   const [recipientQuery, setRecipientQuery] = useState("");
@@ -686,23 +758,31 @@ function SendPage({
   const [confirmationFields, setConfirmationFields] = useState<TemplateField[]>(
     [],
   );
+  const [invalidReplyFields, setInvalidReplyFields] = useState<TemplateField[]>([]);
   const [fieldMenuOpen, setFieldMenuOpen] = useState(false);
   const [confirmationFieldMenuOpen, setConfirmationFieldMenuOpen] =
     useState(false);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const confirmationTextRef = useRef<HTMLTextAreaElement>(null);
+  const invalidReplyTextRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     Promise.all([
       fetch("/api/templates/fields"),
       fetch("/api/templates/confirmation-fields"),
+      fetch("/api/templates/invalid-reply-fields"),
+      fetch("/api/campaigns/recipient-status-counts"),
     ])
-      .then(async ([regular, confirmation]) => {
+      .then(async ([regular, confirmation, invalidReply, statusCounts]) => {
         setFields(regular.ok ? await regular.json() : []);
         setConfirmationFields(confirmation.ok ? await confirmation.json() : []);
+        setInvalidReplyFields(invalidReply.ok ? await invalidReply.json() : []);
+        setRecipientStatusCounts(statusCounts.ok ? await statusCounts.json() : []);
       })
       .catch(() => {
         setFields([]);
         setConfirmationFields([]);
+        setInvalidReplyFields([]);
+        setRecipientStatusCounts([]);
       });
   }, []);
   useEffect(() => {
@@ -768,6 +848,13 @@ function SendPage({
     (text, field) => text.replaceAll(field.token, field.sample),
     confirmationMessage,
   );
+  const invalidReplyPreview = invalidReplyFields.reduce(
+    (text, field) => text.replaceAll(field.token, field.sample),
+    invalidReplyMessage,
+  );
+  const statusRecipientCount = recipientStatusCounts
+    .filter((item) => selectedStatuses.includes(item.status))
+    .reduce((sum, item) => sum + item.count, 0);
   const submit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setBusy(true);
@@ -787,11 +874,14 @@ function SendPage({
         endsAtUtc,
         confirmationEnabled,
         confirmationTemplate: confirmationEnabled ? confirmationMessage : null,
+        invalidReplyEnabled,
+        invalidReplyTemplate: invalidReplyEnabled ? invalidReplyMessage : null,
         sendToAll: recipientMode === "all",
         recipientIds:
           recipientMode === "selected"
             ? selectedRecipients.map((x) => x.id)
             : null,
+        recipientStatuses: recipientMode === "status" ? selectedStatuses : null,
       };
       const r = await fetch("/api/campaigns", {
         method: "POST",
@@ -919,6 +1009,18 @@ function SendPage({
                   <small>{fa(selectedRecipients.length)} نفر انتخاب شده</small>
                 </span>
               </label>
+              <label className={recipientMode === "status" ? "active" : ""}>
+                <input
+                  type="radio"
+                  name="recipientMode"
+                  checked={recipientMode === "status"}
+                  onChange={() => setRecipientMode("status")}
+                />
+                <span>
+                  <b>بر اساس وضعیت پاسخ</b>
+                  <small>{fa(statusRecipientCount)} مخاطب در وضعیت‌های انتخابی</small>
+                </span>
+              </label>
             </div>
             {recipientMode === "selected" && (
               <div className="selected-recipients">
@@ -946,6 +1048,18 @@ function SendPage({
                     </button>
                   </span>
                 ))}
+              </div>
+            )}
+            {recipientMode === "status" && (
+              <div className="status-selection-summary">
+                <div>
+                  <b>{selectedStatuses.length ? `${fa(selectedStatuses.length)} وضعیت انتخاب شده` : "هنوز وضعیتی انتخاب نشده است"}</b>
+                  <small>آخرین پاسخ هر مخاطب ملاک انتخاب است · {fa(statusRecipientCount)} مخاطب</small>
+                </div>
+                <button type="button" onClick={() => setStatusPickerOpen(true)}>انتخاب وضعیت‌ها</button>
+                {selectedStatuses.length > 0 && <div className="selected-status-chips">
+                  {selectedStatuses.map((status) => <span key={status}>{recipientStatusLabels[status] ?? status}<button type="button" aria-label="حذف وضعیت" onClick={() => setSelectedStatuses((values) => values.filter((x) => x !== status))}>×</button></span>)}
+                </div>}
               </div>
             )}
             {recipientMode === "all" && availablePeopleCount === 0 && (
@@ -1044,6 +1158,23 @@ function SendPage({
               <small>{fa(confirmationMessage.length)} از ۵۰۰ نویسه</small>
             </div>
           )}
+          <label className="check">
+            <input type="checkbox" checked={invalidReplyEnabled} onChange={(e) => setInvalidReplyEnabled(e.target.checked)} />
+            <span>
+              <b>ارسال پاسخ خودکار برای پیام نامعتبر</b>
+              <small>فقط برای مخاطب و کمپین شناسایی‌شده ارسال می‌شود و هزینه پیامک دارد.</small>
+            </span>
+          </label>
+          {invalidReplyEnabled && (
+            <div className="template-field confirmation-template">
+              <div className="message-heading"><span>متن پاسخ نامعتبر</span></div>
+              <textarea ref={invalidReplyTextRef} required maxLength={500} value={invalidReplyMessage} onChange={(e) => setInvalidReplyMessage(e.target.value)} />
+              <div className="field-chips">
+                {invalidReplyFields.map((field) => <button type="button" key={field.name} onClick={() => insertAtCursor(field.token, invalidReplyTextRef.current, invalidReplyMessage, setInvalidReplyMessage)}>{field.label}</button>)}
+              </div>
+              <small>{fa(invalidReplyMessage.length)} از ۵۰۰ نویسه</small>
+            </div>
+          )}
           {error && <p className="form-error">{error}</p>}
           <button
             className="primary submit"
@@ -1051,7 +1182,9 @@ function SendPage({
               busy ||
               (recipientMode === "all"
                 ? availablePeopleCount === 0
-                : selectedRecipients.length === 0)
+                : recipientMode === "selected"
+                  ? selectedRecipients.length === 0
+                  : selectedStatuses.length === 0 || statusRecipientCount === 0)
             }
           >
             {busy ? "در حال ثبت…" : "ذخیره در وضعیت آماده ارسال"}
@@ -1069,6 +1202,12 @@ function SendPage({
               <p>{confirmationPreview}</p>
             </div>
           )}
+          {invalidReplyEnabled && (
+            <div className="phone confirmation-phone">
+              <small>پاسخ خودکار پیام نامعتبر</small>
+              <p>{invalidReplyPreview}</p>
+            </div>
+          )}
           <dl>
             <div>
               <dt>تعداد گیرنده</dt>
@@ -1076,7 +1215,9 @@ function SendPage({
                 {fa(
                   recipientMode === "all"
                     ? availablePeopleCount
-                    : selectedRecipients.length,
+                    : recipientMode === "selected"
+                      ? selectedRecipients.length
+                      : statusRecipientCount,
                 )}
               </dd>
             </div>
@@ -1087,6 +1228,10 @@ function SendPage({
             <div>
               <dt>پیام تأیید</dt>
               <dd>{confirmationEnabled ? "فعال" : "غیرفعال"}</dd>
+            </div>
+            <div>
+              <dt>پاسخ نامعتبر</dt>
+              <dd>{invalidReplyEnabled ? "فعال" : "غیرفعال"}</dd>
             </div>
           </dl>
         </aside>
@@ -1159,6 +1304,33 @@ function SendPage({
               >
                 تأیید فهرست
               </button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {statusPickerOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="recipient-modal status-picker-modal" role="dialog" aria-modal="true" aria-label="انتخاب وضعیت پاسخ">
+            <header>
+              <div><h2>انتخاب وضعیت پاسخ</h2><small>امکان انتخاب هم‌زمان چند وضعیت وجود دارد.</small></div>
+              <button type="button" onClick={() => setStatusPickerOpen(false)}>×</button>
+            </header>
+            <div className="status-picker-toolbar">
+              <span>آخرین پاسخ ثبت‌شده هر مخاطب بررسی می‌شود.</span>
+              {selectedStatuses.length > 0 && <button type="button" onClick={() => setSelectedStatuses([])}>پاک کردن انتخاب‌ها</button>}
+            </div>
+            <div className="status-picker-list">
+              {recipientStatusCounts.map((item) => {
+                const checked = selectedStatuses.includes(item.status);
+                return <button type="button" key={item.status} className={checked ? "selected" : ""} onClick={() => setSelectedStatuses((values) => checked ? values.filter((x) => x !== item.status) : [...values, item.status])}>
+                  <i>{checked ? "✓" : ""}</i>
+                  <span><b>{recipientStatusLabels[item.status] ?? item.status}</b><small>{fa(item.count)} مخاطب</small></span>
+                </button>;
+              })}
+            </div>
+            <footer>
+              <span>{fa(selectedStatuses.length)} وضعیت · {fa(statusRecipientCount)} مخاطب</span>
+              <button className="primary" type="button" onClick={() => setStatusPickerOpen(false)}>تأیید انتخاب</button>
             </footer>
           </section>
         </div>
@@ -1452,6 +1624,8 @@ function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void 
   const [editMessage, setEditMessage] = useState("");
   const [editConfirmationEnabled, setEditConfirmationEnabled] = useState(false);
   const [editConfirmation, setEditConfirmation] = useState("");
+  const [editInvalidReplyEnabled, setEditInvalidReplyEnabled] = useState(false);
+  const [editInvalidReply, setEditInvalidReply] = useState("");
   const [editDate, setEditDate] = useState("");
   const [editTime, setEditTime] = useState("");
   const [fields, setFields] = useState<TemplateField[]>([]);
@@ -1470,6 +1644,7 @@ function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void 
     const deadline = jalaliParts(item.endsAtUtc);
     setEditing(item); setEditName(item.name); setEditMessage(item.messageTemplate);
     setEditConfirmationEnabled(item.confirmationEnabled); setEditConfirmation(item.confirmationTemplate ?? "");
+    setEditInvalidReplyEnabled(item.invalidReplyEnabled); setEditInvalidReply(item.invalidReplyTemplate ?? "");
     setEditDate(deadline.date); setEditTime(deadline.time); setError("");
   };
   const save = async (e: FormEvent<HTMLFormElement>) => {
@@ -1478,7 +1653,7 @@ function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void 
       if ((editDate && !editTime) || (!editDate && editTime)) throw new Error("تاریخ و ساعت مهلت را با هم وارد کنید.");
       const r = await fetch(`/api/campaigns/${editing.id}`, {
         method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: editName, messageTemplate: editMessage, endsAtUtc: editDate ? jalaliDeadline(editDate, editTime) : null, confirmationEnabled: editConfirmationEnabled, confirmationTemplate: editConfirmationEnabled ? editConfirmation : null }),
+        body: JSON.stringify({ name: editName, messageTemplate: editMessage, endsAtUtc: editDate ? jalaliDeadline(editDate, editTime) : null, confirmationEnabled: editConfirmationEnabled, confirmationTemplate: editConfirmationEnabled ? editConfirmation : null, invalidReplyEnabled: editInvalidReplyEnabled, invalidReplyTemplate: editInvalidReplyEnabled ? editInvalidReply : null }),
       });
       if (!r.ok) { const p = await r.json().catch(() => null); throw new Error(p?.message ?? "ویرایش کمپین ناموفق بود."); }
       setEditing(null); load();
@@ -1512,6 +1687,7 @@ function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void 
       <div className="campaign-view-field"><span>عنوان کمپین</span><b>{viewing.name}</b></div>
       <div className="campaign-view-field"><span>متن یا قالب پیام</span><pre>{viewing.messageTemplate}</pre></div>
       <div className="campaign-view-field"><span>پیام تأیید</span><pre>{viewing.confirmationEnabled ? viewing.confirmationTemplate || "—" : "غیرفعال"}</pre></div>
+      <div className="campaign-view-field"><span>پاسخ خودکار پیام نامعتبر</span><pre>{viewing.invalidReplyEnabled ? viewing.invalidReplyTemplate || "—" : "غیرفعال"}</pre></div>
       <div className="campaign-view-stats"><span>{fa(viewing.sentCount)} ارسال موفق</span><span>{fa(viewing.failedCount)} خطا</span></div>
       <footer><button type="button" onClick={()=>setViewing(null)}>بستن</button><button type="button" className="primary" onClick={()=>onReuse(viewing)}>استفاده در کمپین جدید</button></footer>
     </section></div>}
@@ -1523,6 +1699,8 @@ function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void 
       <div className="editor-deadline"><label><span>تاریخ شمسی مهلت</span><input value={editDate} onChange={(e)=>setEditDate(e.target.value)} placeholder="۱۴۰۵/۰۸/۲۰" /></label><label><span>ساعت</span><input type="time" value={editTime} onChange={(e)=>setEditTime(e.target.value)} /></label></div>
       <label className="check"><input type="checkbox" checked={editConfirmationEnabled} onChange={(e)=>setEditConfirmationEnabled(e.target.checked)} /><span><b>ارسال پیام تأیید</b></span></label>
       {editConfirmationEnabled&&<label><span>قالب پیام تأیید</span><textarea required value={editConfirmation} onChange={(e)=>setEditConfirmation(e.target.value)} /></label>}
+      <label className="check"><input type="checkbox" checked={editInvalidReplyEnabled} onChange={(e)=>setEditInvalidReplyEnabled(e.target.checked)} /><span><b>پاسخ خودکار پیام نامعتبر</b></span></label>
+      {editInvalidReplyEnabled&&<label><span>متن پاسخ نامعتبر</span><textarea required value={editInvalidReply} onChange={(e)=>setEditInvalidReply(e.target.value)} /></label>}
       <footer><button type="button" onClick={()=>setEditing(null)}>انصراف</button><button className="primary">ذخیره تغییرات</button></footer>
     </form></div>}
   </>;
@@ -1630,9 +1808,12 @@ function InboxPage() {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const [issueType, setIssueType] = useState("");
+  const [campaignId, setCampaignId] = useState("");
+  const [campaigns, setCampaigns] = useState<CampaignJob[]>([]);
   const [appliedSearch, setAppliedSearch] = useState("");
   const [appliedStatus, setAppliedStatus] = useState("");
   const [appliedIssueType, setAppliedIssueType] = useState("");
+  const [appliedCampaignId, setAppliedCampaignId] = useState("");
   const [fromDate, setFromDate] = useState("");
   const [appliedFromUtc, setAppliedFromUtc] = useState("");
   const [dateError, setDateError] = useState("");
@@ -1644,6 +1825,7 @@ function InboxPage() {
     if (appliedSearch) q.set("search", appliedSearch);
     if (appliedStatus) q.set("status", appliedStatus);
     if (appliedIssueType) q.set("issueType", appliedIssueType);
+    if (appliedCampaignId) q.set("campaignId", appliedCampaignId);
     if (appliedFromUtc) q.set("fromUtc", appliedFromUtc);
     fetch(`/api/inbound-messages?${q}`)
       .then((r) => (r.ok ? r.json() : { items: [], total: 0 }))
@@ -1654,6 +1836,7 @@ function InboxPage() {
       .catch(() => setItems([]));
   };
   useEffect(() => {
+    fetch("/api/campaigns/jobs").then((r) => r.ok ? r.json() : []).then(setCampaigns).catch(() => setCampaigns([]));
     fetch("/api/campaigns/latest-start")
       .then((r) => r.ok ? r.json() : { startsAtUtc: null })
       .then((x) => { if (x.startsAtUtc) { setFromDate(jalaliParts(x.startsAtUtc).date); setAppliedFromUtc(x.startsAtUtc); } })
@@ -1664,9 +1847,9 @@ function InboxPage() {
     load();
     const timer = setInterval(load, 15000);
     return () => clearInterval(timer);
-  }, [appliedSearch, appliedStatus, appliedIssueType, appliedFromUtc, page, dateInitialized]);
+  }, [appliedSearch, appliedStatus, appliedIssueType, appliedCampaignId, appliedFromUtc, page, dateInitialized]);
   const searchInbox = () => {
-    try { setDateError(""); setPage(1); setAppliedSearch(search.trim()); setAppliedStatus(status); setAppliedIssueType(issueType); setAppliedFromUtc(fromDate.trim() ? jalaliDeadline(fromDate, "00:00") : ""); }
+    try { setDateError(""); setPage(1); setAppliedSearch(search.trim()); setAppliedStatus(status); setAppliedIssueType(issueType); setAppliedCampaignId(campaignId); setAppliedFromUtc(fromDate.trim() ? jalaliDeadline(fromDate, "00:00") : ""); }
     catch { setDateError("تاریخ شروع را به‌صورت شمسی و در قالب ۱۴۰۵/۰۸/۲۰ وارد کنید."); }
   };
   const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -1674,8 +1857,10 @@ function InboxPage() {
   if (appliedSearch) exportQuery.set("search", appliedSearch);
   if (appliedStatus) exportQuery.set("status", appliedStatus);
   if (appliedIssueType) exportQuery.set("issueType", appliedIssueType);
+  if (appliedCampaignId) exportQuery.set("campaignId", appliedCampaignId);
   if (appliedFromUtc) exportQuery.set("fromUtc", appliedFromUtc);
   const inboundExcelHref = `/api/inbound-messages/export.xlsx?${exportQuery}`;
+  const secondaryAccountQuery = appliedCampaignId ? `?campaignId=${encodeURIComponent(appliedCampaignId)}` : "";
   return (
     <>
       <div className="page-title">
@@ -1686,17 +1871,21 @@ function InboxPage() {
         </div>
         <div className="export-actions">
           <a href={inboundExcelHref}>خروجی اکسل پیام‌ها</a>
-          <a href="/api/secondary-accounts/export.xlsx">اکسل شباهای ثبت‌شده</a>
-          <a href="/api/secondary-accounts/export.csv">CSV شباهای ثبت‌شده</a>
+          <a href={`/api/secondary-accounts/export.xlsx${secondaryAccountQuery}`}>اکسل شباهای ثبت‌شده</a>
+          <a href={`/api/secondary-accounts/export.csv${secondaryAccountQuery}`}>CSV شباهای ثبت‌شده</a>
         </div>
       </div>
-      <section className="card filters">
+      <section className="card filters inbox-filters">
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && searchInbox()}
           placeholder="جست‌وجوی موبایل، متن یا شناسه پیام"
         />
+        <select value={campaignId} onChange={(e) => { setCampaignId(e.target.value); if (e.target.value) setFromDate(""); }}>
+          <option value="">همه کمپین‌ها</option>
+          {campaigns.map((campaign) => <option key={campaign.id} value={campaign.id}>{campaign.name}</option>)}
+        </select>
         <label className="inbox-from-date"><span>از تاریخ</span><input value={fromDate} onChange={(e)=>setFromDate(e.target.value)} placeholder="۱۴۰۵/۰۸/۲۰" inputMode="numeric" /></label>
         <select value={status} onChange={(e) => setStatus(e.target.value)}>
           <option value="">همه وضعیت‌ها</option>
@@ -1722,13 +1911,28 @@ function InboxPage() {
         ) : (
           items.map((x) => (
             <article key={x.id}>
-              <div>
-                <b>{x.senderMobile}</b>
+              <div className="inbound-person">
+                <b>{x.fullName || "مخاطب شناسایی‌نشده"}</b>
                 <small>
-                  ردیف {fa(x.id)} · {new Date(x.receivedAtUtc).toLocaleString("fa-IR")}
+                  {x.senderMobile} · ردیف {fa(x.id)}
                 </small>
+                <small>{new Date(x.receivedAtUtc).toLocaleString("fa-IR")}</small>
+                <small>کمپین: {x.campaignName || "نامشخص"}</small>
+                <small>بانک فعلی: {x.currentBank || "ثبت نشده"}</small>
+                <small className="current-iban">شبای قبلی: {x.currentIban || "ثبت نشده"}</small>
               </div>
-              <p>{x.rawText}</p>
+              <div className="inbound-message-content">
+                <p>{x.rawText}</p>
+                {x.issueType === "MultipleDifferentReplies" && x.previousReplies?.length > 0 && (
+                  <div className="previous-replies">
+                    <b>پاسخ‌های قبلی همین کمپین</b>
+                    {x.previousReplies.map((reply) => <div key={reply.id}>
+                      <span>{reply.rawText}</span>
+                      <small>{new Date(reply.receivedAtUtc).toLocaleString("fa-IR")}{reply.iban ? ` · ${reply.iban}` : ""}</small>
+                    </div>)}
+                  </div>
+                )}
+              </div>
               <span
                 className={`status status-${x.processingStatus.toLowerCase()}`}
               >

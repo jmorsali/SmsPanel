@@ -1,9 +1,10 @@
 # SMS campaigns and inbound replies
 
-This domain covers merchant imports, personalized campaign preparation, explicit dispatch, polling inbound replies, IBAN validation, and reconciliation.
+This domain covers merchant imports, personalized campaign preparation, status-based recipient selection, explicit concurrent dispatch, polling inbound replies, tolerant but checksum-safe IBAN correction, automated replies, campaign-scoped reporting, and reconciliation.
 
 - [Campaign lifecycle](campaign-lifecycle.md)
 - [Inbound reply processing](inbound-replies.md)
+- [Merchant import and person-name normalization](merchant-import.md)
 
 ## Current implementation
 
@@ -14,6 +15,9 @@ Primary sources:
 - `SmsPanel.Api/Services/FarapayamakClient.cs`
 - `SmsPanel.Api/Services/InboundMessageProcessor.cs`
 - `SmsPanel.Api/Services/MessageTemplateRenderer.cs`
+- `SmsPanel.Api/Services/NormalizationServices.cs`
+- `SmsPanel.Api/Services/PersianPersonNameParser.cs`
+- `SmsPanel.Api/Services/MerchantImportWorker.cs`
 - `SmsPanel.Web/src/App.tsx`
 
 Automated checks:

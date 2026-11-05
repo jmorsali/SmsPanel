@@ -5,9 +5,11 @@ namespace SmsPanel.Api.Services;
 
 public sealed partial class IbanService
 {
-    [GeneratedRegex(@"IR(?:[\s\u200C\u200E\u200F\-–—_.:/]*\d){24}|(?<!\d)\d{24}(?!\d)", RegexOptions.IgnoreCase)] private static partial Regex ExtractPattern();
+    [GeneratedRegex(@"IR(?:[\s\u200C\u200E\u200F\-–—_.:/]*\d){24}|(?<!\d)\d{4}\s*[\-–—]\s*\d{4}\s*[\-–—]\s*\d{4}\s*[\-–—]\s*\d{4}\s*[\-–—]\s*\d{8}(?!\d)|(?<!\d)\d{24}(?!\d)", RegexOptions.IgnoreCase)] private static partial Regex ExtractPattern();
     [GeneratedRegex(@"IR(?:[\s\u200C\u200E\u200F\-–—_.:/]*\d){22,23}(?![\s\u200C\u200E\u200F\-–—_.:/]*\d)|(?<!\d)\d{22,23}(?!\d)", RegexOptions.IgnoreCase)] private static partial Regex IncompletePattern();
     [GeneratedRegex(@"IR[0-9A-Z]{24}(?![0-9A-Z])", RegexOptions.IgnoreCase)] private static partial Regex CorrectablePattern();
+    [GeneratedRegex(@"(?<!\d)\d{6}(?:\s*[/\-–—]\s*\d{6}){3}(?!\d)")] private static partial Regex GroupedBodyPattern();
+    [GeneratedRegex(@"(?<!\d)\d{25}(?!\d)")] private static partial Regex ExtraDigitPattern();
     [GeneratedRegex(@"^IR\d{24}$", RegexOptions.IgnoreCase)] private static partial Regex CanonicalPattern();
     public IReadOnlyList<string> Extract(string input) => ExtractPattern().Matches(NormalizeDigits(input))
         .Select(match => "IR" + new string((match.Value.StartsWith("IR", StringComparison.OrdinalIgnoreCase) ? match.Value[2..] : match.Value).Where(char.IsDigit).ToArray()))
@@ -18,12 +20,41 @@ public sealed partial class IbanService
     public IReadOnlyList<string> ExtractCorrectable(string input)
     {
         var corrected = new List<string>();
-        foreach (Match match in CorrectablePattern().Matches(NormalizeDigits(input)))
+        var normalizedInput = NormalizeDigits(input);
+        foreach (Match match in CorrectablePattern().Matches(normalizedInput))
         {
             var body = match.Value[2..].ToCharArray();
             var invalidPositions = body.Select((value, index) => new { value, index }).Where(x => !char.IsDigit(x.value)).ToList();
             if (invalidPositions.Count != 1) continue;
             foreach (var digit in "0123456789") { body[invalidPositions[0].index] = digit; var candidate = "IR" + new string(body); if (IsValid(candidate)) corrected.Add(candidate); }
+        }
+
+        foreach (Match match in GroupedBodyPattern().Matches(normalizedInput))
+        {
+            var candidate = "IR" + new string(match.Value.Where(char.IsDigit).ToArray());
+            if (IsValid(candidate)) corrected.Add(candidate);
+        }
+
+        foreach (Match match in ExtraDigitPattern().Matches(normalizedInput))
+        {
+            var digits = match.Value;
+            var candidates = Enumerable.Range(0, digits.Length)
+                .Select(index => "IR" + digits.Remove(index, 1))
+                .Where(IsValid)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (candidates.Count == 1) corrected.Add(candidates[0]);
+        }
+
+        foreach (var incomplete in ExtractIncomplete(normalizedInput).Where(value => value.Length == 25))
+        {
+            var digits = incomplete[2..];
+            var candidates = Enumerable.Range(0, digits.Length + 1)
+                .SelectMany(index => "0123456789".Select(digit => "IR" + digits.Insert(index, digit.ToString())))
+                .Where(IsValid)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (candidates.Count == 1) corrected.Add(candidates[0]);
         }
         return corrected.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }

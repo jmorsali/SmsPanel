@@ -41,6 +41,12 @@ public sealed partial class MessageTemplateRenderer
         new("ReceivedIbanLast4", "{{چهار_رقم_آخر_شبای_دریافتی}}", "چهار رقم آخر شبای دریافتی", "۹۰۰۲", true)
     ];
 
+    public IReadOnlyList<ResponseTemplateField> InvalidReplyFields =>
+    [
+        .. Fields,
+        new("InvalidReason", "{{دلیل_نامعتبر_بودن}}", "دلیل نامعتبر بودن پاسخ", "شماره شبای معتبر در پیام پیدا نشد", false)
+    ];
+
     public IReadOnlyList<string> GetUnknownFields(string template) => Placeholder().Matches(template)
         .Select(match => match.Groups[1].Value)
         .Where(field => !Accessors.ContainsKey(field))
@@ -63,6 +69,19 @@ public sealed partial class MessageTemplateRenderer
     {
         var field = match.Groups[1].Value;
         if (field.Equals("چهار_رقم_آخر_شبای_دریافتی", StringComparison.OrdinalIgnoreCase) || field.Equals("ReceivedIbanLast4", StringComparison.OrdinalIgnoreCase)) return receivedIban[^4..];
+        return Accessors.TryGetValue(field, out var accessor) ? accessor(person, null) : match.Value;
+    });
+
+    public IReadOnlyList<string> GetUnknownInvalidReplyFields(string template) => Placeholder().Matches(template)
+        .Select(match => match.Groups[1].Value)
+        .Where(field => !Accessors.ContainsKey(field) && !field.Equals("دلیل_نامعتبر_بودن", StringComparison.OrdinalIgnoreCase) && !field.Equals("InvalidReason", StringComparison.OrdinalIgnoreCase))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    public string RenderInvalidReply(string template, Person person, string reason) => Placeholder().Replace(template, match =>
+    {
+        var field = match.Groups[1].Value;
+        if (field.Equals("دلیل_نامعتبر_بودن", StringComparison.OrdinalIgnoreCase) || field.Equals("InvalidReason", StringComparison.OrdinalIgnoreCase)) return reason;
         return Accessors.TryGetValue(field, out var accessor) ? accessor(person, null) : match.Value;
     });
 

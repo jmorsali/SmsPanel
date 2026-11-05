@@ -17,6 +17,8 @@ public sealed class MessagingTests
 
         Assert.Equal("علی احمدی - پارسیان", renderer.Render("{{نام_کامل}} - {{بانک_فعلی}}", person, "پارسیان"));
         Assert.Equal("پایان 9002", renderer.RenderConfirmation("پایان {{چهار_رقم_آخر_شبای_دریافتی}}", person, "IR820540102680020817909002"));
+        Assert.Equal("علی: شماره شبا نامعتبر است", renderer.RenderInvalidReply("{{نام}}: {{دلیل_نامعتبر_بودن}}", person, "شماره شبا نامعتبر است"));
+        Assert.Empty(renderer.GetUnknownInvalidReplyFields("{{نام}}: {{دلیل_نامعتبر_بودن}}"));
     }
 
     [Fact]
@@ -53,7 +55,8 @@ public sealed class MessagingTests
     private static FarapayamakClient CreateClient(HttpMessageHandler handler) => new(
         new HttpClient(handler),
         Options.Create(new FarapayamakOptions { Username = "synthetic-user", Password = "synthetic-password", FromNumber = "20000000" }),
-        NullLogger<FarapayamakClient>.Instance);
+        NullLogger<FarapayamakClient>.Instance,
+        new InboundTextDecoder());
 
     private sealed class RecordingHandler(string responseBody) : HttpMessageHandler
     {

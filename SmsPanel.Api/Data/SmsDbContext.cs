@@ -11,6 +11,7 @@ public sealed class SmsDbContext(DbContextOptions<SmsDbContext> options) : DbCon
         m.Entity<OutboundMessage>().HasIndex(x => new { x.CampaignId, x.PersonId }).IsUnique();
         m.Entity<OutboundMessage>().Property(x => x.RenderedText).HasMaxLength(1000);
         m.Entity<Campaign>().Property(x => x.ConfirmationTemplate).HasMaxLength(1000);
+        m.Entity<Campaign>().Property(x => x.InvalidReplyTemplate).HasMaxLength(1000);
         m.Entity<InboundMessage>().HasIndex(x => new { x.Provider, x.ProviderMessageId }).IsUnique();
         m.Entity<SecondaryBankAccount>().HasIndex(x => new { x.PersonId, x.CampaignId }).IsUnique(); m.Entity<SecondaryBankAccount>().HasIndex(x => x.Iban);
         m.Entity<MerchantImportBatch>().HasIndex(x => x.FileHash);

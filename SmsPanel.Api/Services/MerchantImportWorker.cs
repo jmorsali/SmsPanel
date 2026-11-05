@@ -5,7 +5,7 @@ using SmsPanel.Api.Domain;
 
 namespace SmsPanel.Api.Services;
 
-public sealed class MerchantImportWorker(IServiceScopeFactory scopes, IWebHostEnvironment environment, ILogger<MerchantImportWorker> log) : BackgroundService
+public sealed class MerchantImportWorker(IServiceScopeFactory scopes, IWebHostEnvironment environment, PersianPersonNameParser names, ILogger<MerchantImportWorker> log) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken token)
     {
@@ -57,9 +57,10 @@ public sealed class MerchantImportWorker(IServiceScopeFactory scopes, IWebHostEn
                 if (string.IsNullOrWhiteSpace(rawMobile)) rawMobile = Cell(row, headers, "شماره موبایل");
                 string? mobile = null;
                 if (!string.IsNullOrWhiteSpace(rawMobile)) { try { mobile = mobiles.Normalize(rawMobile); } catch (ArgumentException) { batch.InvalidRows++; } }
+                var parsedName = names.Parse(name);
                 var person = db.People.Local.SingleOrDefault(x => x.NationalCode == nationalId) ?? await db.People.SingleOrDefaultAsync(x => x.NationalCode == nationalId, token);
-                if (person is null && mobile is not null) { person = new Person { NationalCode = nationalId, FirstName = name, LastName = string.Empty, Mobile = mobile, CurrentIban = Cell(row, headers, "شبا"), SourceImportBatchId = batch.Id }; db.People.Add(person); }
-                else if (person is not null && mobile is not null) { person.Mobile = mobile; if (string.IsNullOrWhiteSpace(person.CurrentIban)) person.CurrentIban = Cell(row, headers, "شبا"); }
+                if (person is null && mobile is not null) { person = new Person { NationalCode = nationalId, FirstName = parsedName.FirstName, LastName = parsedName.LastName, Mobile = mobile, CurrentIban = Cell(row, headers, "شبا"), SourceImportBatchId = batch.Id }; db.People.Add(person); }
+                else if (person is not null) { if (mobile is not null) person.Mobile = mobile; if (string.IsNullOrWhiteSpace(person.LastName)) { person.FirstName = parsedName.FirstName; person.LastName = parsedName.LastName; } if (string.IsNullOrWhiteSpace(person.CurrentIban)) person.CurrentIban = Cell(row, headers, "شبا"); }
                 db.Merchants.Add(new Merchant { ImportBatchId = batch.Id, TerminalNumber = terminal, NationalId = nationalId, MerchantName = name, Mobile = mobile, Status = Cell(row, headers, "وضعیت"), CurrentIban = Cell(row, headers, "شبا"), Bank = Cell(row, headers, "بانک"), Agency = Cell(row, headers, "نمایندگی"), PersonId = person?.Id, Person = person });
                 batch.InsertedRows++; batch.ProcessedRows++;
                 if (batch.ProcessedRows % 250 == 0) await db.SaveChangesAsync(token);

@@ -3,7 +3,7 @@ using System.Net.Http.Json;
 using Microsoft.Extensions.Options;
 namespace SmsPanel.Api.Services;
 
-public sealed class FarapayamakOptions { public string BaseUrl { get; set; } = "https://rest.payamak-panel.com/api/SendSMS/"; public string Username { get; set; } = ""; public string Password { get; set; } = ""; public string FromNumber { get; set; } = ""; public bool PollingEnabled { get; set; } = true; public int PollingIntervalMinutes { get; set; } = 1; public int InboxPageSize { get; set; } = 100; public int SendBatchSize { get; set; } = 100; }
+public sealed class FarapayamakOptions { public string BaseUrl { get; set; } = "https://rest.payamak-panel.com/api/SendSMS/"; public string Username { get; set; } = ""; public string Password { get; set; } = ""; public string FromNumber { get; set; } = ""; public bool PollingEnabled { get; set; } = true; public int PollingIntervalMinutes { get; set; } = 1; public int InboxPageSize { get; set; } = 100; public int SendBatchSize { get; set; } = 100; public int SendConcurrency { get; set; } = 5; }
 public sealed record ProviderResponse(string Value, int RetStatus, string? StrRetStatus) { public bool IsSuccess => RetStatus == 1; }
 public sealed record ProviderInboundMessage(string Id, string Sender, string? Receiver, string Text, DateTimeOffset ReceivedAtUtc);
 public interface IFarapayamakClient { Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token); Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token); }

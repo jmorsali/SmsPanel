@@ -83,6 +83,13 @@ namespace SmsPanel.Api.Data.Migrations
                     b.Property<DateTimeOffset?>("EndsAtUtc")
                         .HasColumnType("datetimeoffset");
 
+                    b.Property<bool>("InvalidReplyEnabled")
+                        .HasColumnType("bit");
+
+                    b.Property<string>("InvalidReplyTemplate")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
                     b.Property<string>("MessageTemplate")
                         .IsRequired()
                         .HasColumnType("nvarchar(max)");

@@ -43,34 +43,55 @@ public sealed class InboundReprocessingWorker(IServiceScopeFactory scopes, IbanS
 }
 public sealed class OutboundDispatchWorker(IServiceScopeFactory scopes, IFarapayamakClient client, IOptions<FarapayamakOptions> settings, ILogger<OutboundDispatchWorker> log) : BackgroundService
 {
-    protected override async Task ExecuteAsync(CancellationToken token) { using (var recoveryScope = scopes.CreateScope()) { var recoveryDb = recoveryScope.ServiceProvider.GetRequiredService<SmsDbContext>(); await recoveryDb.OutboundMessages.Where(x => x.Status == OutboundStatus.Processing).ExecuteUpdateAsync(x => x.SetProperty(m => m.Status, OutboundStatus.Pending), token); } while (!token.IsCancellationRequested) { if (!string.IsNullOrWhiteSpace(settings.Value.Username)) try { await Dispatch(token); } catch (Exception ex) { log.LogError(ex, "ارسال صف ناموفق بود."); } await Task.Delay(TimeSpan.FromSeconds(10), token); } }
-    private async Task Dispatch(CancellationToken token)
+    protected override async Task ExecuteAsync(CancellationToken token)
+    {
+        using (var recoveryScope = scopes.CreateScope())
+        {
+            var recoveryDb = recoveryScope.ServiceProvider.GetRequiredService<SmsDbContext>();
+            await recoveryDb.OutboundMessages.Where(x => x.Status == OutboundStatus.Processing).ExecuteUpdateAsync(x => x.SetProperty(m => m.Status, OutboundStatus.Pending), token);
+        }
+        while (!token.IsCancellationRequested)
+        {
+            var dispatched = false;
+            if (!string.IsNullOrWhiteSpace(settings.Value.Username)) try { dispatched = await Dispatch(token); } catch (Exception ex) { log.LogError(ex, "ارسال صف ناموفق بود."); }
+            await Task.Delay(dispatched ? TimeSpan.FromMilliseconds(250) : TimeSpan.FromSeconds(5), token);
+        }
+    }
+
+    private async Task<bool> Dispatch(CancellationToken token)
     {
         using var scope = scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SmsDbContext>();
         var now = DateTimeOffset.UtcNow;
         await db.Campaigns.Where(x => x.Status == CampaignStatus.Active && x.EndsAtUtc != null && x.EndsAtUtc < now)
             .ExecuteUpdateAsync(x => x.SetProperty(c => c.Status, CampaignStatus.Closed), token);
-        var rows = await db.OutboundMessages.Where(x => x.Status == OutboundStatus.Pending).OrderBy(x => x.Id).Take(Math.Clamp(settings.Value.SendBatchSize, 1, 100)).ToListAsync(token);
-        if (rows.Count == 0) { await CloseCompletedCampaigns(db, token); return; }
-        var activeCampaignIds = await db.Campaigns.Where(x => x.Status == CampaignStatus.Active && x.StartsAtUtc <= now && (x.EndsAtUtc == null || x.EndsAtUtc >= now)).Select(x => x.Id).ToListAsync(token);
-        rows = rows.Where(x => activeCampaignIds.Contains(x.CampaignId)).ToList();
+        var rows = await db.OutboundMessages
+            .Where(message => message.Status == OutboundStatus.Pending && db.Campaigns.Any(campaign => campaign.Id == message.CampaignId && campaign.Status == CampaignStatus.Active && campaign.StartsAtUtc <= now && (campaign.EndsAtUtc == null || campaign.EndsAtUtc >= now)))
+            .OrderBy(x => x.Id).Take(Math.Clamp(settings.Value.SendBatchSize, 1, 100)).ToListAsync(token);
+        if (rows.Count == 0) { await CloseCompletedCampaigns(db, token); return false; }
         var personIds = rows.Select(x => x.PersonId).ToList();
-        var mobiles = await db.People.Where(x => personIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.Mobile, token);
+        var mobiles = await db.People.AsNoTracking().Where(x => personIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.Mobile, token);
         foreach (var row in rows)
         {
             if (!mobiles.TryGetValue(row.PersonId, out var mobile))
             {
                 row.Status = OutboundStatus.Failed;
                 row.LastError = "شماره موبایل مخاطب یافت نشد.";
-                await db.SaveChangesAsync(token);
                 continue;
             }
             row.Status = OutboundStatus.Processing; row.AttemptCount++;
-            await db.SaveChangesAsync(token);
+        }
+        await db.SaveChangesAsync(token);
+
+        var dispatchable = rows.Where(row => row.Status == OutboundStatus.Processing).Select(row => new DispatchItem(row.Id, mobiles[row.PersonId], row.RenderedText)).ToList();
+        await Parallel.ForEachAsync(dispatchable, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(settings.Value.SendConcurrency, 1, 20), CancellationToken = token }, async (item, itemToken) =>
+        {
+            using var itemScope = scopes.CreateScope();
+            var itemDb = itemScope.ServiceProvider.GetRequiredService<SmsDbContext>();
+            var row = await itemDb.OutboundMessages.SingleAsync(x => x.Id == item.Id, itemToken);
             try
             {
-                var response = await client.SendAsync([mobile], row.RenderedText, token);
+                var response = await client.SendAsync([item.Mobile], item.RenderedText, itemToken);
                 row.ProviderReference = response.Value;
                 row.Status = response.IsSuccess ? OutboundStatus.Sent : OutboundStatus.Failed;
                 row.SentAtUtc = response.IsSuccess ? DateTimeOffset.UtcNow : null;
@@ -83,10 +104,13 @@ public sealed class OutboundDispatchWorker(IServiceScopeFactory scopes, IFarapay
                 row.Status = row.AttemptCount >= 5 ? OutboundStatus.Failed : OutboundStatus.Pending;
                 row.LastError = ex.Message;
             }
-            await db.SaveChangesAsync(token);
-        }
+            await itemDb.SaveChangesAsync(itemToken);
+        });
         await CloseCompletedCampaigns(db, token);
+        return true;
     }
+
+    private sealed record DispatchItem(long Id, string Mobile, string RenderedText);
 
     private static Task<int> CloseCompletedCampaigns(SmsDbContext db, CancellationToken token) =>
         db.Campaigns
