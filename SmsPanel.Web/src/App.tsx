@@ -11,14 +11,13 @@ type Page =
   | "campaigns"
   | "jobs"
   | "inbox"
-  | "issues"
   | "users"
   | "settings";
 type NavIconName = "dashboard" | "merchants" | "search" | "upload" | "sms" | "send" | "campaigns" | "jobs" | "inbox" | "issues" | "system" | "users" | "settings" | "chevron";
 const pagePaths: Record<Page, string> = {
   dashboard: "/", merchants: "/merchants", imports: "/merchants/import",
   send: "/sms/send", campaigns: "/sms/campaigns", jobs: "/sms/jobs",
-  inbox: "/sms/inbox", issues: "/sms/issues", users: "/system/users", settings: "/system/settings",
+  inbox: "/sms/inbox", users: "/system/users", settings: "/system/settings",
 };
 const pagesByPath = Object.fromEntries(Object.entries(pagePaths).map(([page, path]) => [path, page as Page])) as Record<string, Page>;
 const pageFromLocation = (): Page => pagesByPath[window.location.pathname.replace(/\/+$/, "") || "/"] ?? "dashboard";
@@ -31,9 +30,19 @@ type Dashboard = {
 };
 type Issue = {
   id: number;
+  inboundMessageId: number;
   senderMobile: string;
   extractedIban?: string;
   issueType: string;
+  createdAtUtc: string;
+  campaignId?: number;
+  campaignName?: string;
+  personId?: number;
+  fullName?: string;
+  currentRegisteredIban?: string;
+  rawText?: string;
+  receivedAtUtc?: string;
+  canFinalize: boolean;
 };
 type TemplateField = {
   name: string;
@@ -99,9 +108,14 @@ type Inbound = {
   currentBank?: string;
   campaignId?: number;
   campaignName?: string;
+  issueId?: number;
+  currentRegisteredIban?: string;
+  ownershipVerified?: boolean | null;
+  canFinalize: boolean;
   previousReplies: PreviousInboundReply[];
 };
 type PreviousInboundReply = { id: number; rawText: string; receivedAtUtc: string; iban?: string };
+type BulkRecipientPreview = { messageCount: number; uniqueMobileCount: number; recipientCount: number; skippedCount: number };
 type CurrentUser = { username: string; displayName: string; isAdmin: boolean };
 type ManagedUser = {
   id: number;
@@ -151,6 +165,8 @@ const issueLabels: Record<string, string> = {
   RequestNotActive: "درخواست غیرفعال",
   RequestAmbiguous: "کمپین مبهم",
   IncompleteIban: "شماره شبا ناقص است",
+  BankCardNumberReceived: "شماره کارت دریافت شده",
+  AccountHolderNameMismatch: "نام صاحب حساب با پذیرنده مطابقت ندارد",
 };
 const recipientStatusLabels: Record<string, string> = {
   Successful: "پاسخ موفق و شبای ثبت‌شده",
@@ -164,12 +180,30 @@ const recipientStatusLabels: Record<string, string> = {
   RequestNotActive: "درخواست غیرفعال",
   RequestAmbiguous: "کمپین مبهم",
   IncompleteIban: "شماره شبای ناقص",
+  BankCardNumberReceived: "شماره کارت دریافت شده",
+  AccountHolderNameMismatch: "نام صاحب حساب با پذیرنده مطابقت ندارد",
 };
 const fa = (value: number) => value.toLocaleString("fa-IR");
 const latinDigits = (value: string) =>
   value
     .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
     .replace(/[٠-٩]/g, (d) => String("٠١٢٣٤٥٦٧٨٩".indexOf(d)));
+const validBankCards = (value: string) => {
+  const candidates = latinDigits(value).match(/(?<!\d)(?:\d[\s\-–—]*){16}(?!\d)/g) ?? [];
+  return [...new Set(candidates.map((candidate) => candidate.replace(/\D/g, "")).filter((digits) => {
+    if (digits.length !== 16 || /^([0-9])\1{15}$/.test(digits)) return false;
+    const sum = [...digits].reduce((total, digit, index) => { let number = Number(digit); if (index % 2 === 0) { number *= 2; if (number > 9) number -= 9; } return total + number; }, 0);
+    return sum % 10 === 0;
+  }))];
+};
+const cardConversionDetails = (rawText?: string) => {
+  const cardNumber = validBankCards(rawText ?? "")[0]; if (!cardNumber) return null;
+  if (cardNumber.startsWith("621986")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک سامان" };
+  if (cardNumber.startsWith("502938")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک دی" };
+  if (cardNumber.startsWith("585983") || cardNumber.startsWith("627353")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک تجارت" };
+  if (cardNumber.startsWith("603769")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک صادرات" };
+  return { supported: false, last4: cardNumber.slice(-4), bankName: "بانک صادرکننده" };
+};
 const jalaliDeadline = (date: string, time: string) => {
   const parts = latinDigits(date).trim().split(/[\/-]/).map(Number);
   if (parts.length !== 3 || !isValidJalaaliDate(parts[0], parts[1], parts[2]))
@@ -200,7 +234,6 @@ function App() {
   const [page, setPage] = useState<Page>(pageFromLocation);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [stats, setStats] = useState(emptyDashboard);
-  const [issues, setIssues] = useState<Issue[]>([]);
   const [online, setOnline] = useState(false);
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [needsSetup, setNeedsSetup] = useState(false);
@@ -210,12 +243,10 @@ function App() {
     Promise.all([
       fetch("/health"),
       fetch("/api/dashboard", { cache: "no-store" }),
-      fetch("/api/reconciliation-issues"),
     ])
-      .then(async ([h, d, i]) => {
+      .then(async ([h, d]) => {
         setOnline(h.ok);
         if (d.ok) setStats(await d.json());
-        if (i.ok) setIssues(await i.json());
       })
       .catch(() => setOnline(false));
   useEffect(() => {
@@ -235,7 +266,10 @@ function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
   useEffect(() => {
-    if (user && page === "dashboard") refresh();
+    if (!user || page !== "dashboard") return;
+    refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    return () => window.clearInterval(timer);
   }, [page, user]);
   const navigate = (nextPage: Page) => {
     const path = pagePaths[nextPage];
@@ -293,7 +327,6 @@ function App() {
                   campaigns: "مدیریت کمپین‌ها",
                   jobs: "روند ارسال",
                   inbox: "پیام‌های دریافتی",
-                  issues: "مغایرت‌ها",
                   users: "مدیریت کاربران",
                   settings: "تنظیمات",
                 }[page]
@@ -322,7 +355,6 @@ function App() {
           )}{" "}
           {page === "campaigns" && <CampaignsPage onReuse={(campaign) => { setCampaignSeed(campaign); navigate("send"); }} />}{" "}
           {page === "jobs" && <JobsPage />} {page === "inbox" && <InboxPage />}{" "}
-          {page === "issues" && <IssuesPage issues={issues} />}{" "}
           {page === "users" && user.isAdmin && <UsersPage />}{" "}
           {page === "settings" && <SettingsPage />}
         </div>
@@ -385,7 +417,7 @@ function Nav({
   const [openGroup, setOpenGroup] = useState<"merchants" | "sms" | "system" | null>(
     ["merchants", "imports"].includes(page)
       ? "merchants"
-      : ["send", "campaigns", "jobs", "inbox", "issues"].includes(page)
+      : ["send", "campaigns", "jobs", "inbox"].includes(page)
         ? "sms"
         : ["users", "settings"].includes(page) ? "system" : null,
   );
@@ -410,7 +442,7 @@ function Nav({
     <nav>
       {item("dashboard", "dashboard", "نمای کلی")}
       {group("merchants", "merchants", "پذیرندگان", <>{item("merchants", "search", "جستجو")}{item("imports", "upload", "ورود اطلاعات پذیرندگان")}</>)}
-      {group("sms", "sms", "پیامک", <>{item("send", "send", "ارسال جدید")}{item("campaigns", "campaigns", "مدیریت کمپین‌ها")}{item("jobs", "jobs", "روند ارسال")}{item("inbox", "inbox", "پیام‌های دریافتی")}{item("issues", "issues", "مغایرت‌ها")}</>)}
+      {group("sms", "sms", "پیامک", <>{item("send", "send", "ارسال جدید")}{item("campaigns", "campaigns", "مدیریت کمپین‌ها")}{item("jobs", "jobs", "روند ارسال")}{item("inbox", "inbox", "پیام‌های دریافتی")}</>)}
       {group("system", "system", "مدیریت سیستم", <>{isAdmin && item("users", "users", "مدیریت کاربران")}{item("settings", "settings", "تنظیمات")}</>)}
     </nav>
   );
@@ -1819,6 +1851,13 @@ function InboxPage() {
   const [dateError, setDateError] = useState("");
   const [dateInitialized, setDateInitialized] = useState(false);
   const [page, setPage] = useState(1);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkTitle, setBulkTitle] = useState("ارسال گروهی نتایج پیام‌های دریافتی");
+  const [bulkText, setBulkText] = useState("");
+  const [bulkPreview, setBulkPreview] = useState<BulkRecipientPreview | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState("");
+  const [bulkNotice, setBulkNotice] = useState("");
   const pageSize = 50;
   const load = () => {
     const q = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
@@ -1861,6 +1900,24 @@ function InboxPage() {
   if (appliedFromUtc) exportQuery.set("fromUtc", appliedFromUtc);
   const inboundExcelHref = `/api/inbound-messages/export.xlsx?${exportQuery}`;
   const secondaryAccountQuery = appliedCampaignId ? `?campaignId=${encodeURIComponent(appliedCampaignId)}` : "";
+  const openBulkMessage = async () => {
+    setBulkOpen(true); setBulkText(""); setBulkError(""); setBulkPreview(null);
+    try {
+      const response = await fetch(`/api/inbound-messages/bulk-recipient-count?${exportQuery}`);
+      if (!response.ok) throw new Error("شمارش مخاطبان قابل دریافت نیست.");
+      setBulkPreview(await response.json());
+    } catch (x) { setBulkError(x instanceof Error ? x.message : "خطای ناشناخته"); }
+  };
+  const sendBulkMessage = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); setBulkBusy(true); setBulkError("");
+    try {
+      const response = await fetch("/api/inbound-messages/bulk-message", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: bulkTitle, text: bulkText, search: appliedSearch || null, status: appliedStatus || null, issueType: appliedIssueType || null, campaignId: appliedCampaignId ? Number(appliedCampaignId) : null, fromUtc: appliedFromUtc || null }) });
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(result?.message ?? "ایجاد ارسال گروهی ناموفق بود.");
+      setBulkOpen(false); setBulkNotice(`ارسال گروهی برای ${fa(result.recipientCount)} مخاطب در صف قرار گرفت.`);
+    } catch (x) { setBulkError(x instanceof Error ? x.message : "خطای ناشناخته"); }
+    finally { setBulkBusy(false); }
+  };
   return (
     <>
       <div className="page-title">
@@ -1870,11 +1927,13 @@ function InboxPage() {
           <p>پاسخ‌ها را جست‌وجو و بر اساس نتیجه پردازش فیلتر کنید.</p>
         </div>
         <div className="export-actions">
+          <button type="button" onClick={openBulkMessage} disabled={total === 0}>ارسال پیام به نتایج</button>
           <a href={inboundExcelHref}>خروجی اکسل پیام‌ها</a>
           <a href={`/api/secondary-accounts/export.xlsx${secondaryAccountQuery}`}>اکسل شباهای ثبت‌شده</a>
           <a href={`/api/secondary-accounts/export.csv${secondaryAccountQuery}`}>CSV شباهای ثبت‌شده</a>
         </div>
       </div>
+      {bulkNotice && <p className="success-notice">{bulkNotice}</p>}
       <section className="card filters inbox-filters">
         <input
           value={search}
@@ -1891,6 +1950,7 @@ function InboxPage() {
           <option value="">همه وضعیت‌ها</option>
           <option value="Processed">پاسخ موفق</option>
           <option value="ReconciliationRequired">نیازمند بررسی</option>
+          <option value="ResolvedManually">نهایی‌شده دستی</option>
           <option value="Pending">در انتظار پردازش</option>
           <option value="Failed">خطای پردازش</option>
         </select>
@@ -1920,9 +1980,13 @@ function InboxPage() {
                 <small>کمپین: {x.campaignName || "نامشخص"}</small>
                 <small>بانک فعلی: {x.currentBank || "ثبت نشده"}</small>
                 <small className="current-iban">شبای قبلی: {x.currentIban || "ثبت نشده"}</small>
+                <small className={`ownership-state ownership-${x.ownershipVerified === true ? "verified" : x.ownershipVerified === false ? "mismatch" : "unknown"}`}>
+                  وضعیت مالکیت شبا: {x.ownershipVerified === true ? "تأییدشده" : x.ownershipVerified === false ? "مغایرت نام" : "بررسی‌نشده"}
+                </small>
               </div>
               <div className="inbound-message-content">
                 <p>{x.rawText}</p>
+                {x.lastError && <small className="review-reason">دلیل بررسی: {x.lastError}</small>}
                 {x.issueType === "MultipleDifferentReplies" && x.previousReplies?.length > 0 && (
                   <div className="previous-replies">
                     <b>پاسخ‌های قبلی همین کمپین</b>
@@ -1933,17 +1997,19 @@ function InboxPage() {
                   </div>
                 )}
               </div>
-              <span
-                className={`status status-${x.processingStatus.toLowerCase()}`}
-              >
+              <div className="inbound-review-actions"><span className={`status status-${x.processingStatus.toLowerCase()}`}>
                 {x.processingStatus === "Processed"
                   ? "پاسخ موفق"
+                  : x.processingStatus === "ResolvedManually"
+                    ? "نهایی‌شده دستی"
                   : x.processingStatus === "ReconciliationRequired"
                     ? `نیازمند بررسی — ${issueLabels[x.issueType ?? ""] ?? "علت نامشخص"}`
                     : x.processingStatus === "Pending"
                       ? "در انتظار"
                       : "خطا"}
               </span>
+              {x.processingStatus === "ReconciliationRequired" && x.issueId && <IssueActions issue={{ id: x.issueId, inboundMessageId: x.id, senderMobile: x.senderMobile, extractedIban: x.iban, issueType: x.issueType || "", createdAtUtc: x.receivedAtUtc, campaignId: x.campaignId, campaignName: x.campaignName, fullName: x.fullName, currentRegisteredIban: x.currentRegisteredIban, rawText: x.rawText, receivedAtUtc: x.receivedAtUtc, canFinalize: x.canFinalize }} onChanged={load} />}
+              </div>
               {x.iban && <code>{x.iban}</code>}
             </article>
           ))
@@ -1954,41 +2020,101 @@ function InboxPage() {
           <button disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>صفحه بعد</button>
         </div>
       </section>
+      {bulkOpen && <div className="modal-backdrop"><form className="campaign-editor bulk-message-modal" onSubmit={sendBulkMessage}>
+        <header><div><h2>ارسال پیام به نتایج جستجو</h2><small>هر شماره موبایل فقط یک‌بار پیام دریافت می‌کند.</small></div><button type="button" onClick={() => !bulkBusy && setBulkOpen(false)}>×</button></header>
+        {bulkPreview ? <div className="bulk-preview-stats"><span><b>{fa(bulkPreview.messageCount)}</b><small>پیام منطبق</small></span><span><b>{fa(bulkPreview.uniqueMobileCount)}</b><small>شماره یکتا</small></span><span><b>{fa(bulkPreview.recipientCount)}</b><small>مخاطب قابل ارسال</small></span><span><b>{fa(bulkPreview.skippedCount)}</b><small>غیرقابل ارسال</small></span></div> : <div className="bulk-preview-loading">در حال محاسبه مخاطبان…</div>}
+        <label><span>عنوان ارسال</span><input required maxLength={200} value={bulkTitle} onChange={(e) => setBulkTitle(e.target.value)} /></label>
+        <label><span>متن پیام</span><textarea required maxLength={500} value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder="متنی که برای تمام مخاطبان نتیجه جستجو ارسال می‌شود" /></label>
+        <small className="message-cost-note">این عملیات برای هر مخاطب یک پیامک جدید و دارای هزینه ایجاد می‌کند. ارسال پس از تأیید بلافاصله در صف پس‌زمینه آغاز می‌شود. · {fa(bulkText.length)} از ۵۰۰ نویسه</small>
+        {bulkError && <p className="form-error">{bulkError}</p>}
+        <footer><button type="button" onClick={() => !bulkBusy && setBulkOpen(false)}>انصراف</button><button className="primary" disabled={bulkBusy || !bulkPreview || bulkPreview.recipientCount === 0 || !bulkText.trim()}>{bulkBusy ? "در حال ایجاد صف…" : `تأیید و ارسال برای ${fa(bulkPreview?.recipientCount ?? 0)} مخاطب`}</button></footer>
+      </form></div>}
     </>
   );
 }
 
-function IssuesPage({ issues }: { issues: Issue[] }) {
-  return (
-    <>
-      <div className="page-title">
-        <div>
-          <span>کنترل داده‌ها</span>
-          <h1>جدول مغایرت‌ها</h1>
-          <p>پاسخ‌های نامعتبر یا مبهم برای بررسی دستی.</p>
-        </div>
+function IssueActions({ issue, onChanged }: { issue: Issue; onChanged: () => void }) {
+  const [mode, setMode] = useState<"finalize" | "message" | "card" | null>(null);
+  const [iban, setIban] = useState("");
+  const [note, setNote] = useState("");
+  const [message, setMessage] = useState("");
+  const [captcha, setCaptcha] = useState("");
+  const [conversionSession, setConversionSession] = useState<{sessionId:string;captchaImage:string;expiresAtUtc:string;bankName:string;cardLast4:string;captchaHint?:string}|null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const cardDetails = cardConversionDetails(issue.rawText);
+  const close = () => { if (!busy) { setMode(null); setError(""); } };
+  const finalize = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); setBusy(true); setError("");
+    try {
+      const response = await fetch(`/api/reconciliation-issues/${issue.id}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ iban, note: note.trim() || null }) });
+      if (!response.ok) { const problem = await response.json().catch(() => null); throw new Error(problem?.message ?? "ثبت شبای نهایی ناموفق بود."); }
+      setMode(null); onChanged();
+    } catch (x) { setError(x instanceof Error ? x.message : "خطای ناشناخته"); }
+    finally { setBusy(false); }
+  };
+  const sendMessage = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); setBusy(true); setError("");
+    try {
+      const response = await fetch(`/api/reconciliation-issues/${issue.id}/send-message`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: message }) });
+      if (!response.ok) { const problem = await response.json().catch(() => null); throw new Error(problem?.message ?? "ارسال پیام اختصاصی ناموفق بود."); }
+      setMode(null); setMessage(""); onChanged();
+    } catch (x) { setError(x instanceof Error ? x.message : "خطای ناشناخته"); }
+    finally { setBusy(false); }
+  };
+  const finalizeConvertedIban = async (convertedIban: string, bankName: string) => {
+    const response = await fetch(`/api/reconciliation-issues/${issue.id}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ iban: convertedIban, note: `تبدیل شماره کارت از طریق سرویس رسمی ${bankName}` }) });
+    const result = await response.json().catch(() => null); if (!response.ok) throw new Error(result?.message ?? "شبا دریافت شد، اما ثبت نهایی ناموفق بود.");
+  };
+  const startCardConversion = async () => {
+    setMode("card"); setBusy(true); setError(""); setCaptcha(""); setConversionSession(null);
+    try { const response = await fetch(`/api/reconciliation-issues/${issue.id}/card-conversion/start`, { method: "POST" }); const result = await response.json().catch(() => null); if (!response.ok) throw new Error(result?.message ?? "دریافت اطلاعات بانک ناموفق بود."); if (result.iban) { if (result.requiresReview) { setError(result.reviewReason ?? "نتیجه تبدیل برای بررسی دستی نگه داشته شد."); onChanged(); } else { await finalizeConvertedIban(result.iban, result.bankName); setMode(null); onChanged(); } } else setConversionSession(result); }
+    catch (x) { setError(x instanceof Error ? x.message : "خطای ناشناخته"); }
+    finally { setBusy(false); }
+  };
+  const completeCardConversion = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); if (!conversionSession) return; setBusy(true); setError("");
+    try {
+      const conversionResponse = await fetch(`/api/reconciliation-issues/${issue.id}/card-conversion/complete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: conversionSession.sessionId, captcha }) });
+      const conversion = await conversionResponse.json().catch(() => null); if (!conversionResponse.ok) throw new Error(conversion?.message ?? "تبدیل شماره کارت ناموفق بود.");
+      if (conversion.requiresReview) { setError(conversion.reviewReason ?? "نتیجه تبدیل برای بررسی دستی نگه داشته شد."); onChanged(); }
+      else { await finalizeConvertedIban(conversion.iban, conversionSession.bankName); setMode(null); onChanged(); }
+    } catch (x) { setError(x instanceof Error ? x.message : "خطای ناشناخته"); setConversionSession(null); }
+    finally { setBusy(false); }
+  };
+  return <>
+    <div className="issue-actions">
+      <button disabled={!issue.canFinalize} title={issue.canFinalize ? "" : "مخاطب یا کمپین این پیام مشخص نیست"} onClick={() => { setIban(""); setNote(""); setError(""); setMode("finalize"); }}>تعیین تکلیف</button>
+      <button onClick={() => { setMessage(""); setError(""); setMode("message"); }}>ارسال پیام</button>
+      {issue.issueType === "BankCardNumberReceived" && cardDetails && <button disabled={!cardDetails.supported || busy} title={cardDetails.supported ? "" : "سرویس رسمی این بانک هنوز پشتیبانی نمی‌شود"} onClick={startCardConversion}>تبدیل کارت به شبا</button>}
+    </div>
+    {mode === "finalize" && <div className="modal-backdrop"><form className="campaign-editor finalize-issue-modal" onSubmit={finalize}>
+      <header><div><h2>ثبت شبای نهایی</h2><small>{issue.fullName || issue.senderMobile} · {issue.campaignName || "کمپین نامشخص"}</small></div><button type="button" onClick={close}>×</button></header>
+      <div className="finalize-history"><span><b>پاسخ فعلی</b><small>{issue.rawText || "—"}</small></span>{issue.extractedIban && <button type="button" onClick={() => setIban(issue.extractedIban!)}>استفاده از شبای پاسخ: {issue.extractedIban}</button>}{issue.currentRegisteredIban && <button type="button" onClick={() => setIban(issue.currentRegisteredIban!)}>حفظ شبای ثبت‌شده: {issue.currentRegisteredIban}</button>}</div>
+      <label><span>شماره شبای نهایی</span><input required value={iban} onChange={(e) => setIban(e.target.value)} placeholder="IRxxxxxxxxxxxxxxxxxxxxxxxx" dir="ltr" /></label>
+      <label><span>یادداشت تصمیم <small>اختیاری</small></span><textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="برای نمونه: تأیید تلفنی پذیرنده" /></label>
+      <p className="privacy-note">با ثبت نهایی، همه مغایرت‌های باز این مخاطب در همین کمپین حل‌شده علامت می‌خورند.</p>{error && <p className="form-error">{error}</p>}
+      <footer><button type="button" onClick={close}>انصراف</button><button className="primary" disabled={busy}>{busy ? "در حال ثبت…" : "تأیید و ثبت نهایی"}</button></footer>
+    </form></div>}
+    {mode === "card" && cardDetails && <div className="modal-backdrop"><form className="campaign-editor finalize-issue-modal" onSubmit={completeCardConversion}>
+      <header><div><h2>تبدیل شماره کارت به شبا</h2><small>{cardDetails.bankName} · کارت پایان‌یافته به {cardDetails.last4}</small></div><button type="button" onClick={close}>×</button></header>
+      <div className="card-conversion-steps">
+        <b>کد امنیتی سایت رسمی {cardDetails.bankName}</b>
+        {busy && !conversionSession && <small>در حال دریافت تصویر از بانک…</small>}
+        {conversionSession && <><img className="bank-captcha" src={conversionSession.captchaImage} alt="کد امنیتی بانک" />{conversionSession.captchaHint && <div className="captcha-hint"><b>عملیات لازم روی تصویر</b><span>{conversionSession.captchaHint}</span></div>}<label><span>پاسخ محاسبه</span><input required autoFocus value={captcha} onChange={(e) => setCaptcha(latinDigits(e.target.value))} inputMode="numeric" autoComplete="off" /></label><small>عددهای داخل تصویر را مطابق عملیات بالا محاسبه و نتیجه را وارد کنید. این نشست پنج دقیقه اعتبار دارد.</small></>}
+        {!conversionSession && !busy && <button type="button" className="bank-site-button" onClick={startCardConversion}>دریافت تصویر جدید</button>}
       </div>
-      <section className="card table-card">
-        {issues.length === 0 ? (
-          <div className="empty">
-            <b>✓</b>
-            <h3>مغایرت بازی وجود ندارد</h3>
-          </div>
-        ) : (
-          issues.map((x) => (
-            <div className="issue" key={x.id}>
-              <span>
-                <b>{x.senderMobile}</b>
-                <small>{issueLabels[x.issueType] ?? x.issueType}</small>
-              </span>
-              <code>{x.extractedIban ?? "بدون شبا"}</code>
-              <button>بررسی</button>
-            </div>
-          ))
-        )}
-      </section>
-    </>
-  );
+      {error && <p className="form-error">{error}</p>}
+      <footer><button type="button" onClick={close}>انصراف</button><button className="primary" disabled={busy || !conversionSession || !captcha.trim()}>{busy ? "در حال استعلام…" : "تبدیل و ثبت نهایی"}</button></footer>
+    </form></div>}
+    {mode === "message" && <div className="modal-backdrop"><form className="campaign-editor finalize-issue-modal" onSubmit={sendMessage}>
+      <header><div><h2>ارسال پیام اختصاصی</h2><small>{issue.fullName || issue.senderMobile} · {issue.senderMobile}</small></div><button type="button" onClick={close}>×</button></header>
+      <div className="finalize-history"><span><b>پیام دریافتی</b><small>{issue.rawText || "—"}</small></span><span><b>دلیل بررسی</b><small>{issueLabels[issue.issueType] ?? issue.issueType}</small></span></div>
+      <label><span>متن پیام</span><textarea required maxLength={500} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="متن اختصاصی برای این مخاطب" /></label>
+      <small className="message-cost-note">این عملیات یک پیامک جدید ارسال می‌کند و هزینه دارد. · {fa(message.length)} از ۵۰۰ نویسه</small>{error && <p className="form-error">{error}</p>}
+      <footer><button type="button" onClick={close}>انصراف</button><button className="primary" disabled={busy || !message.trim()}>{busy ? "در حال ارسال…" : "تأیید و ارسال پیام"}</button></footer>
+    </form></div>}
+  </>;
 }
 function SettingsPage() {
   return (

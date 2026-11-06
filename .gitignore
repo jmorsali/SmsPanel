@@ -7,3 +7,6 @@ appsettings.Local.json
 node_modules/
 dist/
 .run/
+/.buildcheck*
+/SmsPanel.Api/.buildcheck
+/SmsPanel.Api/.buildcheck*

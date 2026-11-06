@@ -16,6 +16,8 @@ Primary sources:
 - `SmsPanel.Api/Services/InboundMessageProcessor.cs`
 - `SmsPanel.Api/Services/MessageTemplateRenderer.cs`
 - `SmsPanel.Api/Services/NormalizationServices.cs`
+- `SmsPanel.Api/Services/IbanOwnershipVerificationService.cs`
+- `SmsPanel.Api/Services/InboundPersonNameResolver.cs`
 - `SmsPanel.Api/Services/PersianPersonNameParser.cs`
 - `SmsPanel.Api/Services/MerchantImportWorker.cs`
 - `SmsPanel.Web/src/App.tsx`
@@ -24,3 +26,4 @@ Automated checks:
 
 - `SmsPanel.Tests/MessagingTests.cs`
 - `SmsPanel.Tests/NormalizationTests.cs`
+- `SmsPanel.Tests/PersonNameMatcherTests.cs`

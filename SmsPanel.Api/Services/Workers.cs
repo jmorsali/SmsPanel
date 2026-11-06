@@ -9,7 +9,7 @@ public sealed class InboxPollingWorker(IServiceScopeFactory scopes, IFarapayamak
     protected override async Task ExecuteAsync(CancellationToken token) { while (!token.IsCancellationRequested) { if (settings.Value.PollingEnabled && !string.IsNullOrWhiteSpace(settings.Value.Username)) try { await Poll(token); } catch (Exception ex) { log.LogError(ex, "واکشی صندوق ورودی ناموفق بود."); } await Task.Delay(TimeSpan.FromMinutes(Math.Max(1, settings.Value.PollingIntervalMinutes)), token); } }
     private async Task Poll(CancellationToken token) { for (var index = 0; ; index += settings.Value.InboxPageSize) { var list = await client.GetMessagesAsync(index, settings.Value.InboxPageSize, token); foreach (var item in list) { using var scope = scopes.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<SmsDbContext>(); if (await db.InboundMessages.AnyAsync(x => x.Provider == "Farapayamak" && x.ProviderMessageId == item.Id, token)) continue; var msg = new InboundMessage { Provider = "Farapayamak", ProviderMessageId = item.Id, SenderMobile = item.Sender, ReceiverNumber = item.Receiver, RawText = item.Text, ReceivedAtUtc = item.ReceivedAtUtc, FetchedAtUtc = DateTimeOffset.UtcNow, ProcessingStatus = ProcessingStatus.Pending }; db.Add(msg); await db.SaveChangesAsync(token); await scope.ServiceProvider.GetRequiredService<InboundMessageProcessor>().ProcessAsync(msg, token); } if (list.Count < settings.Value.InboxPageSize) break; } }
 }
-public sealed class InboundReprocessingWorker(IServiceScopeFactory scopes, IbanService ibans, InboundTextDecoder textDecoder, ILogger<InboundReprocessingWorker> log) : BackgroundService
+public sealed class InboundReprocessingWorker(IServiceScopeFactory scopes, IbanService ibans, BankCardService cards, InboundTextDecoder textDecoder, ILogger<InboundReprocessingWorker> log) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken token)
     {
@@ -24,12 +24,13 @@ public sealed class InboundReprocessingWorker(IServiceScopeFactory scopes, IbanS
                 .Where(message => message.ProcessingStatus != ProcessingStatus.Processed && db.SecondaryBankAccounts.Any(account => account.InboundMessageId == message.Id))
                 .ExecuteUpdateAsync(x => x.SetProperty(message => message.ProcessingStatus, ProcessingStatus.Processed).SetProperty(message => message.LastError, (string?)null), token);
             var candidateIds = await db.ReconciliationIssues.AsNoTracking()
-                .Where(x => x.Status == IssueStatus.Open && (x.IssueType == IssueType.NoIbanFound || x.IssueType == IssueType.MultipleIbansFound))
+                .Where(x => x.Status == IssueStatus.Open && (x.IssueType == IssueType.MobileNotFound || x.IssueType == IssueType.MobileMatchesMultiplePeople || x.IssueType == IssueType.RequestNotActive || x.IssueType == IssueType.NoIbanFound || x.IssueType == IssueType.MultipleIbansFound ||
+                    (x.IssueType == IssueType.BankCardNumberReceived && db.InboundMessages.Any(message => message.Id == x.InboundMessageId && message.RawText.Contains("شبا")))))
                 .Select(x => x.InboundMessageId).Distinct().ToListAsync(token);
             var candidates = await db.InboundMessages.Where(x => candidateIds.Contains(x.Id)).ToListAsync(token);
             var processor = scope.ServiceProvider.GetRequiredService<InboundMessageProcessor>();
             var reprocessed = 0;
-            foreach (var message in candidates.Where(x => ibans.Extract(x.RawText).Any(ibans.IsValid) || ibans.ExtractCorrectable(x.RawText).Count > 0 || ibans.ExtractIncomplete(x.RawText).Count == 1))
+            foreach (var message in candidates.Where(x => ibans.Extract(x.RawText).Any(ibans.IsValid) || ibans.ExtractCorrectable(x.RawText).Count > 0 || ibans.ExtractIncomplete(x.RawText).Count == 1 || cards.ExtractValid(x.RawText).Count > 0))
             {
                 await db.ReconciliationIssues.Where(x => x.InboundMessageId == message.Id && x.Status == IssueStatus.Open).ExecuteDeleteAsync(token);
                 message.ProcessingStatus = ProcessingStatus.Pending; message.LastError = null; await db.SaveChangesAsync(token);

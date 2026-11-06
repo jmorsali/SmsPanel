@@ -123,6 +123,9 @@ namespace SmsPanel.Api.Data.Migrations
                     b.Property<string>("LastError")
                         .HasColumnType("nvarchar(max)");
 
+                    b.Property<long?>("MatchedPersonId")
+                        .HasColumnType("bigint");
+
                     b.Property<int>("ProcessingStatus")
                         .HasColumnType("int");
 
@@ -149,6 +152,8 @@ namespace SmsPanel.Api.Data.Migrations
                         .HasColumnType("nvarchar(max)");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("MatchedPersonId");
 
                     b.HasIndex("Provider", "ProviderMessageId")
                         .IsUnique();
@@ -402,6 +407,49 @@ namespace SmsPanel.Api.Data.Migrations
                     b.ToTable("ReconciliationIssues");
                 });
 
+            modelBuilder.Entity("SmsPanel.Api.Domain.ReconciliationIssueMessage", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("CreatedAtUtc")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("LastError")
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("ProviderReference")
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<long>("ReconciliationIssueId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTimeOffset?>("SentAtUtc")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("SentBy")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("nvarchar(100)");
+
+                    b.Property<int>("Status")
+                        .HasColumnType("int");
+
+                    b.Property<string>("Text")
+                        .IsRequired()
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ReconciliationIssueId");
+
+                    b.ToTable("ReconciliationIssueMessages");
+                });
+
             modelBuilder.Entity("SmsPanel.Api.Domain.SecondaryBankAccount", b =>
                 {
                     b.Property<long>("Id")
@@ -420,7 +468,7 @@ namespace SmsPanel.Api.Data.Migrations
                     b.Property<long>("InboundMessageId")
                         .HasColumnType("bigint");
 
-                    b.Property<bool>("OwnershipVerified")
+                    b.Property<bool?>("OwnershipVerified")
                         .HasColumnType("bit");
 
                     b.Property<long>("PersonId")
@@ -439,6 +487,14 @@ namespace SmsPanel.Api.Data.Migrations
                     b.ToTable("SecondaryBankAccounts");
                 });
 
+            modelBuilder.Entity("SmsPanel.Api.Domain.InboundMessage", b =>
+                {
+                    b.HasOne("SmsPanel.Api.Domain.Person", null)
+                        .WithMany()
+                        .HasForeignKey("MatchedPersonId")
+                        .OnDelete(DeleteBehavior.SetNull);
+                });
+
             modelBuilder.Entity("SmsPanel.Api.Domain.Merchant", b =>
                 {
                     b.HasOne("SmsPanel.Api.Domain.MerchantImportBatch", null)
@@ -453,6 +509,15 @@ namespace SmsPanel.Api.Data.Migrations
                         .OnDelete(DeleteBehavior.SetNull);
 
                     b.Navigation("Person");
+                });
+
+            modelBuilder.Entity("SmsPanel.Api.Domain.ReconciliationIssueMessage", b =>
+                {
+                    b.HasOne("SmsPanel.Api.Domain.ReconciliationIssue", null)
+                        .WithMany()
+                        .HasForeignKey("ReconciliationIssueId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 #pragma warning restore 612, 618
         }

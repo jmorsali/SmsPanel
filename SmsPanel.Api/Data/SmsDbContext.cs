@@ -4,7 +4,7 @@ namespace SmsPanel.Api.Data;
 
 public sealed class SmsDbContext(DbContextOptions<SmsDbContext> options) : DbContext(options)
 {
-    public DbSet<Person> People => Set<Person>(); public DbSet<Campaign> Campaigns => Set<Campaign>(); public DbSet<OutboundMessage> OutboundMessages => Set<OutboundMessage>(); public DbSet<InboundMessage> InboundMessages => Set<InboundMessage>(); public DbSet<SecondaryBankAccount> SecondaryBankAccounts => Set<SecondaryBankAccount>(); public DbSet<ReconciliationIssue> ReconciliationIssues => Set<ReconciliationIssue>(); public DbSet<MerchantImportBatch> MerchantImportBatches => Set<MerchantImportBatch>(); public DbSet<Merchant> Merchants => Set<Merchant>(); public DbSet<AppUser> AppUsers => Set<AppUser>();
+    public DbSet<Person> People => Set<Person>(); public DbSet<Campaign> Campaigns => Set<Campaign>(); public DbSet<OutboundMessage> OutboundMessages => Set<OutboundMessage>(); public DbSet<InboundMessage> InboundMessages => Set<InboundMessage>(); public DbSet<SecondaryBankAccount> SecondaryBankAccounts => Set<SecondaryBankAccount>(); public DbSet<ReconciliationIssue> ReconciliationIssues => Set<ReconciliationIssue>(); public DbSet<ReconciliationIssueMessage> ReconciliationIssueMessages => Set<ReconciliationIssueMessage>(); public DbSet<MerchantImportBatch> MerchantImportBatches => Set<MerchantImportBatch>(); public DbSet<Merchant> Merchants => Set<Merchant>(); public DbSet<AppUser> AppUsers => Set<AppUser>();
     protected override void OnModelCreating(ModelBuilder m)
     {
         m.Entity<Person>().HasIndex(x => x.NationalCode).IsUnique(); m.Entity<Person>().HasIndex(x => x.Mobile); m.Entity<Person>().HasIndex(x => x.SourceImportBatchId); m.Entity<Person>().Property(x => x.Mobile).HasMaxLength(11); m.Entity<Person>().Property(x => x.CurrentIban).HasMaxLength(26);
@@ -13,7 +13,9 @@ public sealed class SmsDbContext(DbContextOptions<SmsDbContext> options) : DbCon
         m.Entity<Campaign>().Property(x => x.ConfirmationTemplate).HasMaxLength(1000);
         m.Entity<Campaign>().Property(x => x.InvalidReplyTemplate).HasMaxLength(1000);
         m.Entity<InboundMessage>().HasIndex(x => new { x.Provider, x.ProviderMessageId }).IsUnique();
+        m.Entity<InboundMessage>().HasIndex(x => x.MatchedPersonId); m.Entity<InboundMessage>().HasOne<Person>().WithMany().HasForeignKey(x => x.MatchedPersonId).OnDelete(DeleteBehavior.SetNull);
         m.Entity<SecondaryBankAccount>().HasIndex(x => new { x.PersonId, x.CampaignId }).IsUnique(); m.Entity<SecondaryBankAccount>().HasIndex(x => x.Iban);
+        m.Entity<ReconciliationIssueMessage>().Property(x => x.Text).HasMaxLength(1000); m.Entity<ReconciliationIssueMessage>().Property(x => x.SentBy).HasMaxLength(100); m.Entity<ReconciliationIssueMessage>().HasIndex(x => x.ReconciliationIssueId); m.Entity<ReconciliationIssueMessage>().HasOne<ReconciliationIssue>().WithMany().HasForeignKey(x => x.ReconciliationIssueId).OnDelete(DeleteBehavior.Cascade);
         m.Entity<MerchantImportBatch>().HasIndex(x => x.FileHash);
         m.Entity<Merchant>().HasIndex(x => x.TerminalNumber).IsUnique();
         m.Entity<Merchant>().HasIndex(x => x.NationalId);
