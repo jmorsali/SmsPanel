@@ -4,6 +4,7 @@ This domain covers merchant imports, personalized campaign preparation, status-b
 
 - [Campaign lifecycle](campaign-lifecycle.md)
 - [Inbound reply processing](inbound-replies.md)
+- The inbound flow also covers operator-assisted card-to-IBAN conversion, linked-person resolution, and account-holder name review.
 - [Merchant import and person-name normalization](merchant-import.md)
 
 ## Current implementation

@@ -58,6 +58,15 @@ sequenceDiagram
 - Bank Saderat (`019`) currently supports automated ownership lookup through an isolated hidden-browser session. Other bank codes remain `null` until an adapter is implemented.
 - A confirmed ownership mismatch does not finalize a new reply. Existing accounts are retained, marked `false`, and moved to `AccountHolderNameMismatch` review. An unavailable bank or inconclusive response never changes message status.
 
+## Card-to-IBAN review
+
+- Card replies remain reconciliation items until an operator starts the bank conversion and confirms the result.
+- Bank Mellat cards with prefixes `610433` and `991975` are handled through the bank's official electronic counter in an isolated hidden-browser session.
+- The operator enters the bank CAPTCHA shown in the panel. The system submits the four card segments in the same bank session, follows the confirmation step, and accepts only one checksum-valid IBAN.
+- When the bank returns an account-holder name, it is compared with the linked person at the same 90% normalized-name threshold. A mismatch stays open as `AccountHolderNameMismatch`.
+- Person resolution consistently prefers `InboundMessage.MatchedPersonId`. A unique sender-mobile match is only the fallback. This rule applies to issue display, bank-holder comparison, and manual finalization.
+- Manual finalization resolves only open issues for the same campaign and linked person. For messages without a linked person, the legacy unique-mobile scope is retained.
+
 ## Side effects and failure paths
 
 - Successful processing creates one secondary account per person and campaign.
@@ -75,3 +84,4 @@ sequenceDiagram
 - Polling is used because no stable public webhook endpoint is available.
 - Automated confirmation and invalid-reply provider calls are made after the database transaction; a provider failure does not roll back the successfully classified inbound message.
 - Public bank pages and anti-automation controls are external dependencies. Unsupported banks and transient lookup failures deliberately leave ownership as unknown rather than creating a mismatch.
+- Bank Mellat conversion requires a fresh CAPTCHA and an unchanged official form. Expired sessions, bank-side validation errors, and form changes fail without recording an IBAN.

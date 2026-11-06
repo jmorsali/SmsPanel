@@ -202,6 +202,7 @@ const cardConversionDetails = (rawText?: string) => {
   if (cardNumber.startsWith("502938")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک دی" };
   if (cardNumber.startsWith("585983") || cardNumber.startsWith("627353")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک تجارت" };
   if (cardNumber.startsWith("603769")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک صادرات" };
+  if (cardNumber.startsWith("610433") || cardNumber.startsWith("991975")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک ملت" };
   return { supported: false, last4: cardNumber.slice(-4), bankName: "بانک صادرکننده" };
 };
 const jalaliDeadline = (date: string, time: string) => {

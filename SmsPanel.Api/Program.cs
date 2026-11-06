@@ -21,6 +21,7 @@ builder.Services.AddSingleton<SamanCardToIbanService>();
 builder.Services.AddSingleton<DayCardToIbanService>();
 builder.Services.AddSingleton<TejaratCardToIbanService>();
 builder.Services.AddSingleton<BsiCardToIbanService>();
+builder.Services.AddSingleton<MellatCardToIbanService>();
 builder.Services.AddSingleton<IbanOwnershipVerificationService>();
 builder.Services.AddSingleton<MobileNormalizer>();
 builder.Services.AddSingleton<MessageTemplateRenderer>();
@@ -225,19 +226,24 @@ app.MapPost("/api/campaigns/{id:long}/start", async (long id, SmsDbContext db, C
 app.MapGet("/api/reconciliation-issues", async (SmsDbContext db, CancellationToken token) =>
 {
     var issues = await db.ReconciliationIssues.AsNoTracking().Where(x => x.Status == IssueStatus.Open).OrderByDescending(x => x.CreatedAtUtc).Take(500).ToListAsync(token);
+    var messages = await db.InboundMessages.AsNoTracking().Where(x => issues.Select(i => i.InboundMessageId).Contains(x.Id)).ToDictionaryAsync(x => x.Id, token);
     var mobiles = issues.Select(x => x.SenderMobile).Distinct().ToList();
-    var people = (await db.People.AsNoTracking().Where(x => mobiles.Contains(x.Mobile)).ToListAsync(token)).GroupBy(x => x.Mobile).Where(x => x.Count() == 1).ToDictionary(x => x.Key, x => x.Single());
+    var matchedPersonIds = messages.Values.Where(x => x.MatchedPersonId.HasValue).Select(x => x.MatchedPersonId!.Value).Distinct().ToList();
+    var loadedPeople = await db.People.AsNoTracking().Where(x => matchedPersonIds.Contains(x.Id) || mobiles.Contains(x.Mobile)).ToListAsync(token);
+    var peopleById = loadedPeople.ToDictionary(x => x.Id);
+    var peopleByMobile = loadedPeople.GroupBy(x => x.Mobile).Where(x => x.Count() == 1).ToDictionary(x => x.Key, x => x.Single());
     var campaignIds = issues.Where(x => x.CampaignId.HasValue).Select(x => x.CampaignId!.Value).Distinct().ToList();
     var campaigns = await db.Campaigns.AsNoTracking().Where(x => campaignIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.Name, token);
-    var personIds = people.Values.Select(x => x.Id).ToList();
+    var personIds = loadedPeople.Select(x => x.Id).Distinct().ToList();
     var accounts = await db.SecondaryBankAccounts.AsNoTracking().Where(x => personIds.Contains(x.PersonId) && campaignIds.Contains(x.CampaignId)).ToListAsync(token);
-    var messages = await db.InboundMessages.AsNoTracking().Where(x => issues.Select(i => i.InboundMessageId).Contains(x.Id)).ToDictionaryAsync(x => x.Id, token);
     var result = issues.Select(issue =>
     {
-        people.TryGetValue(issue.SenderMobile, out var person);
+        messages.TryGetValue(issue.InboundMessageId, out var message);
+        Person? person = null;
+        if (message?.MatchedPersonId is long matchedPersonId) peopleById.TryGetValue(matchedPersonId, out person);
+        if (person is null) peopleByMobile.TryGetValue(issue.SenderMobile, out person);
         var campaignName = issue.CampaignId.HasValue && campaigns.TryGetValue(issue.CampaignId.Value, out var name) ? name : null;
         var currentRegisteredIban = person is null || !issue.CampaignId.HasValue ? null : accounts.FirstOrDefault(x => x.PersonId == person.Id && x.CampaignId == issue.CampaignId.Value)?.Iban;
-        messages.TryGetValue(issue.InboundMessageId, out var message);
         return new ResponseReconciliationIssue(issue.Id, issue.InboundMessageId, issue.SenderMobile, issue.ExtractedIban, issue.IssueType, issue.CreatedAtUtc, issue.CampaignId, campaignName, person?.Id, person is null ? null : $"{person.FirstName} {person.LastName}".Trim(), currentRegisteredIban, message?.RawText, message?.ReceivedAtUtc, person is not null && issue.CampaignId.HasValue);
     }).ToList();
     return Results.Ok(result);
@@ -250,9 +256,8 @@ app.MapPost("/api/reconciliation-issues/{id:long}/finalize", async (long id, Req
     var issue = await db.ReconciliationIssues.SingleOrDefaultAsync(x => x.Id == id && x.Status == IssueStatus.Open, token);
     if (issue is null) return Results.NotFound(new { message = "مغایرت باز یافت نشد یا قبلاً نهایی شده است." });
     if (!issue.CampaignId.HasValue) return Results.Conflict(new { message = "این مغایرت به کمپین مشخصی متصل نیست و قابل نهایی‌سازی خودکار نیست." });
-    var people = await db.People.Where(x => x.Mobile == issue.SenderMobile).ToListAsync(token);
-    if (people.Count != 1) return Results.Conflict(new { message = "مخاطب این پیام به‌صورت یکتا قابل تشخیص نیست." });
-    var person = people[0];
+    var person = await ResolveIssuePersonAsync(db, issue, token);
+    if (person is null) return Results.Conflict(new { message = "مخاطب این پیام به‌صورت یکتا قابل تشخیص نیست." });
     if (person.CurrentIban?.Equals(finalIban, StringComparison.OrdinalIgnoreCase) == true) return Results.Conflict(new { message = "شبای نهایی نمی‌تواند با شبای فعلی مخاطب یکسان باشد." });
     if (await db.SecondaryBankAccounts.AnyAsync(x => x.Iban == finalIban && x.PersonId != person.Id, token)) return Results.Conflict(new { message = "این شماره شبا قبلاً برای مخاطب دیگری ثبت شده است." });
     var message = await db.InboundMessages.SingleAsync(x => x.Id == issue.InboundMessageId, token);
@@ -266,7 +271,10 @@ app.MapPost("/api/reconciliation-issues/{id:long}/finalize", async (long id, Req
     {
         account.Iban = finalIban; account.InboundMessageId = issue.InboundMessageId; account.ReceivedAtUtc = message.ReceivedAtUtc;
     }
-    var relatedIssues = await db.ReconciliationIssues.Where(x => x.Status == IssueStatus.Open && x.CampaignId == issue.CampaignId && x.SenderMobile == issue.SenderMobile).ToListAsync(token);
+    var relatedIssues = await db.ReconciliationIssues.Where(x => x.Status == IssueStatus.Open && x.CampaignId == issue.CampaignId &&
+        (message.MatchedPersonId.HasValue
+            ? db.InboundMessages.Any(inbound => inbound.Id == x.InboundMessageId && inbound.MatchedPersonId == person.Id)
+            : x.SenderMobile == issue.SenderMobile)).ToListAsync(token);
     var relatedMessageIds = relatedIssues.Select(x => x.InboundMessageId).Distinct().ToList();
     var resolution = $"ثبت دستی شبای نهایی توسط {principal.Identity?.Name ?? "کاربر سامانه"}." + (string.IsNullOrWhiteSpace(request.Note) ? string.Empty : $" {request.Note.Trim()}");
     foreach (var relatedIssue in relatedIssues) { relatedIssue.Status = IssueStatus.Resolved; relatedIssue.ResolutionNote = resolution; relatedIssue.ResolvedAtUtc = DateTimeOffset.UtcNow; }
@@ -275,7 +283,7 @@ app.MapPost("/api/reconciliation-issues/{id:long}/finalize", async (long id, Req
     await db.SaveChangesAsync(token);
     return Results.Ok(new ResponseFinalizeReconciliationIssue(issue.Id, person.Id, issue.CampaignId.Value, finalIban, relatedIssues.Count));
 });
-app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/start", async (long id, ClaimsPrincipal principal, SmsDbContext db, BankCardService cards, SamanCardToIbanService saman, DayCardToIbanService day, TejaratCardToIbanService tejarat, BsiCardToIbanService bsi, CancellationToken token) =>
+app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/start", async (long id, ClaimsPrincipal principal, SmsDbContext db, BankCardService cards, SamanCardToIbanService saman, DayCardToIbanService day, TejaratCardToIbanService tejarat, BsiCardToIbanService bsi, MellatCardToIbanService mellat, CancellationToken token) =>
 {
     var issue = await db.ReconciliationIssues.SingleOrDefaultAsync(x => x.Id == id && x.Status == IssueStatus.Open && x.IssueType == IssueType.BankCardNumberReceived, token);
     if (issue is null) return Results.NotFound(new { message = "درخواست باز تبدیل شماره کارت یافت نشد." });
@@ -306,6 +314,11 @@ app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/start", async 
             var review = await CheckConvertedAccountHolderAsync(db, issue, conversion, token);
             return Results.Ok(new ResponseStartCardConversion(string.Empty, string.Empty, DateTimeOffset.UtcNow, "بانک صادرات", cardNumbers[0][^4..], conversion.Iban, null, conversion.AccountHolderName, review.RequiresReview, review.Reason));
         }
+        if (cardNumbers[0].StartsWith("610433", StringComparison.Ordinal) || cardNumbers[0].StartsWith("991975", StringComparison.Ordinal))
+        {
+            var result = await mellat.StartAsync(owner, cardNumbers[0], token);
+            return Results.Ok(new ResponseStartCardConversion("mellat_" + result.SessionId, result.CaptchaImage, result.ExpiresAtUtc, "بانک ملت", cardNumbers[0][^4..]));
+        }
         return Results.Conflict(new { message = "برای بانک صادرکننده این کارت هنوز سرویس رسمی تبدیل فعال نشده است." });
     }
     catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidOperationException)
@@ -313,7 +326,7 @@ app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/start", async 
         return Results.Json(new { message = ex.Message }, statusCode: StatusCodes.Status502BadGateway);
     }
 });
-app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/complete", async (long id, RequestCompleteCardConversion request, ClaimsPrincipal principal, SmsDbContext db, SamanCardToIbanService saman, DayCardToIbanService day, TejaratCardToIbanService tejarat, CancellationToken token) =>
+app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/complete", async (long id, RequestCompleteCardConversion request, ClaimsPrincipal principal, SmsDbContext db, SamanCardToIbanService saman, DayCardToIbanService day, TejaratCardToIbanService tejarat, MellatCardToIbanService mellat, CancellationToken token) =>
 {
     if (string.IsNullOrWhiteSpace(request.SessionId) || string.IsNullOrWhiteSpace(request.Captcha)) return Results.BadRequest(new { message = "کد امنیتی را وارد کنید." });
     var issue = await db.ReconciliationIssues.SingleOrDefaultAsync(x => x.Id == id && x.Status == IssueStatus.Open && x.IssueType == IssueType.BankCardNumberReceived, token);
@@ -327,6 +340,8 @@ app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/complete", asy
                 ? await day.CompleteAsync(owner, request.SessionId[4..], request.Captcha, token)
                 : request.SessionId.StartsWith("tejarat_", StringComparison.Ordinal)
                     ? await tejarat.CompleteAsync(owner, request.SessionId[8..], request.Captcha, token)
+                : request.SessionId.StartsWith("mellat_", StringComparison.Ordinal)
+                    ? await mellat.CompleteAsync(owner, request.SessionId[7..], request.Captcha, token)
                 : throw new InvalidOperationException("نشست تبدیل بانک معتبر نیست؛ تصویر جدید بگیرید.");
         var review = await CheckConvertedAccountHolderAsync(db, issue, conversion, token);
         return Results.Ok(new ResponseCompleteCardConversion(conversion.Iban, conversion.AccountHolderName, review.RequiresReview, review.Reason));
@@ -569,9 +584,9 @@ static async Task SignIn(HttpContext http, AppUser user) { var claims = new List
 static async Task<(bool RequiresReview, string? Reason)> CheckConvertedAccountHolderAsync(SmsDbContext db, ReconciliationIssue issue, BankCardConversionResult conversion, CancellationToken token)
 {
     if (string.IsNullOrWhiteSpace(conversion.AccountHolderName)) return (false, null);
-    var people = await db.People.Where(x => x.Mobile == issue.SenderMobile).ToListAsync(token);
-    if (people.Count != 1) return (false, null);
-    var expectedName = $"{people[0].FirstName} {people[0].LastName}".Trim();
+    var person = await ResolveIssuePersonAsync(db, issue, token);
+    if (person is null) return (false, null);
+    var expectedName = $"{person.FirstName} {person.LastName}".Trim();
     if (NamesMatch(expectedName, conversion.AccountHolderName)) return (false, null);
     var reason = $"نام صاحب حساب اعلام‌شده توسط بانک با نام پذیرنده مطابقت ندارد. نام بانک: {conversion.AccountHolderName}؛ نام پذیرنده: {expectedName}.";
     issue.IssueType = IssueType.AccountHolderNameMismatch;
@@ -582,6 +597,13 @@ static async Task<(bool RequiresReview, string? Reason)> CheckConvertedAccountHo
     message.LastError = reason;
     await db.SaveChangesAsync(token);
     return (true, reason);
+}
+static async Task<Person?> ResolveIssuePersonAsync(SmsDbContext db, ReconciliationIssue issue, CancellationToken token)
+{
+    var matchedPersonId = await db.InboundMessages.Where(x => x.Id == issue.InboundMessageId).Select(x => x.MatchedPersonId).SingleAsync(token);
+    if (matchedPersonId.HasValue) return await db.People.SingleOrDefaultAsync(x => x.Id == matchedPersonId.Value, token);
+    var people = await db.People.Where(x => x.Mobile == issue.SenderMobile).Take(2).ToListAsync(token);
+    return people.Count == 1 ? people[0] : null;
 }
 static bool NamesMatch(string expected, string actual)
 {
