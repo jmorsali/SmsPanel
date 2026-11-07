@@ -85,20 +85,37 @@ public sealed class OutboundDispatchWorker(IServiceScopeFactory scopes, IFarapay
         await db.SaveChangesAsync(token);
 
         var dispatchable = rows.Where(row => row.Status == OutboundStatus.Processing).Select(row => new DispatchItem(row.Id, mobiles[row.PersonId], row.RenderedText)).ToList();
+        var insufficientCredit = 0;
+        const string insufficientCreditMessage = "اعتبار پنل پیامک کافی نیست؛ ارسال متوقف شد. پس از افزایش اعتبار، ادامه ارسال را بزنید.";
         await Parallel.ForEachAsync(dispatchable, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(settings.Value.SendConcurrency, 1, 20), CancellationToken = token }, async (item, itemToken) =>
         {
             using var itemScope = scopes.CreateScope();
             var itemDb = itemScope.ServiceProvider.GetRequiredService<SmsDbContext>();
             var row = await itemDb.OutboundMessages.SingleAsync(x => x.Id == item.Id, itemToken);
+            if (Volatile.Read(ref insufficientCredit) == 1)
+            {
+                row.Status = OutboundStatus.Pending;
+                row.LastError = insufficientCreditMessage;
+                await itemDb.SaveChangesAsync(itemToken);
+                return;
+            }
             try
             {
                 var response = await client.SendAsync([item.Mobile], item.RenderedText, itemToken);
                 row.ProviderReference = response.Value;
-                row.Status = response.IsSuccess ? OutboundStatus.Sent : OutboundStatus.Failed;
-                row.SentAtUtc = response.IsSuccess ? DateTimeOffset.UtcNow : null;
-                row.LastError = response.IsSuccess ? null : response.Value == "7"
-                    ? "متن پیام توسط فیلتر سرویس رد شد."
-                    : response.StrRetStatus ?? $"خطای سرویس پیامک ({response.Value})";
+                if (response.IsInsufficientCredit)
+                {
+                    Interlocked.Exchange(ref insufficientCredit, 1);
+                    row.Status = OutboundStatus.Pending;
+                    row.SentAtUtc = null;
+                    row.LastError = response.ErrorMessage;
+                }
+                else
+                {
+                    row.Status = response.IsSuccess ? OutboundStatus.Sent : OutboundStatus.Failed;
+                    row.SentAtUtc = response.IsSuccess ? DateTimeOffset.UtcNow : null;
+                    row.LastError = response.IsSuccess ? null : response.ErrorMessage;
+                }
             }
             catch (Exception ex)
             {
@@ -107,6 +124,15 @@ public sealed class OutboundDispatchWorker(IServiceScopeFactory scopes, IFarapay
             }
             await itemDb.SaveChangesAsync(itemToken);
         });
+        if (Volatile.Read(ref insufficientCredit) == 1)
+        {
+            var affectedCampaignIds = await db.Campaigns.Where(x => x.Status == CampaignStatus.Active).Select(x => x.Id).ToListAsync(token);
+            await db.Campaigns.Where(x => affectedCampaignIds.Contains(x.Id))
+                .ExecuteUpdateAsync(x => x.SetProperty(c => c.Status, CampaignStatus.Suspended), token);
+            await db.OutboundMessages.Where(x => affectedCampaignIds.Contains(x.CampaignId) && (x.Status == OutboundStatus.Pending || x.Status == OutboundStatus.Processing))
+                .ExecuteUpdateAsync(x => x.SetProperty(m => m.Status, OutboundStatus.Pending).SetProperty(m => m.LastError, insufficientCreditMessage), token);
+            log.LogWarning("ارسال {CampaignCount} کمپین به علت کافی نبودن اعتبار پنل پیامک متوقف شد.", affectedCampaignIds.Count);
+        }
         await CloseCompletedCampaigns(db, token);
         return true;
     }

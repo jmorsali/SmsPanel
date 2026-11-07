@@ -12,12 +12,13 @@ type Page =
   | "jobs"
   | "inbox"
   | "users"
+  | "transactions"
   | "settings";
-type NavIconName = "dashboard" | "merchants" | "search" | "upload" | "sms" | "send" | "campaigns" | "jobs" | "inbox" | "issues" | "system" | "users" | "settings" | "chevron";
+type NavIconName = "dashboard" | "merchants" | "search" | "upload" | "sms" | "send" | "campaigns" | "jobs" | "inbox" | "issues" | "system" | "users" | "transactions" | "settings" | "chevron";
 const pagePaths: Record<Page, string> = {
   dashboard: "/", merchants: "/merchants", imports: "/merchants/import",
   send: "/sms/send", campaigns: "/sms/campaigns", jobs: "/sms/jobs",
-  inbox: "/sms/inbox", users: "/system/users", settings: "/system/settings",
+  inbox: "/sms/inbox", users: "/system/users", transactions: "/system/credit-transactions", settings: "/system/settings",
 };
 const pagesByPath = Object.fromEntries(Object.entries(pagePaths).map(([page, path]) => [path, page as Page])) as Record<string, Page>;
 const pageFromLocation = (): Page => pagesByPath[window.location.pathname.replace(/\/+$/, "") || "/"] ?? "dashboard";
@@ -27,6 +28,7 @@ type Dashboard = {
   sentCount: number;
   receivedIbanCount: number;
   openIssueCount: number;
+  providerCredit: number | null;
 };
 type Issue = {
   id: number;
@@ -74,6 +76,7 @@ type CampaignJob = {
   processing: number;
   sent: number;
   failed: number;
+  alert?: string | null;
 };
 type FailedOutboundMessage = { id: number; fullName: string; mobile: string; attemptCount: number; error: string };
 type CampaignSummary = {
@@ -84,7 +87,7 @@ type CampaignSummary = {
   confirmationTemplate?: string;
   invalidReplyEnabled: boolean;
   invalidReplyTemplate?: string;
-  status: "Draft" | "Active" | "Closed";
+  status: "Draft" | "Active" | "Closed" | "Suspended";
   startsAtUtc: string;
   endsAtUtc?: string;
   recipientCount: number;
@@ -126,6 +129,8 @@ type ManagedUser = {
   createdAtUtc: string;
   lastLoginAtUtc?: string;
 };
+type CreditTransaction = { id: number; amount: number; remainingCredit: number; transactedAtUtc: string; description?: string; type: number; sendCode: number };
+type CreditTransactionResult = { items: CreditTransaction[]; total: number; page: number; pageSize: number; totalCharge: number; totalConsumption: number; currentCredit?: number };
 type Merchant = {
   id: number;
   terminalNumber: string;
@@ -152,6 +157,7 @@ const emptyDashboard: Dashboard = {
   sentCount: 0,
   receivedIbanCount: 0,
   openIssueCount: 0,
+  providerCredit: null,
 };
 const issueLabels: Record<string, string> = {
   MobileNotFound: "شماره ناشناس",
@@ -203,6 +209,7 @@ const cardConversionDetails = (rawText?: string) => {
   if (cardNumber.startsWith("585983") || cardNumber.startsWith("627353")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک تجارت" };
   if (cardNumber.startsWith("603769")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک صادرات" };
   if (cardNumber.startsWith("610433") || cardNumber.startsWith("991975")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک ملت" };
+  if (cardNumber.startsWith("589463")) return { supported: true, last4: cardNumber.slice(-4), bankName: "بانک رفاه" };
   return { supported: false, last4: cardNumber.slice(-4), bankName: "بانک صادرکننده" };
 };
 const jalaliDeadline = (date: string, time: string) => {
@@ -236,6 +243,7 @@ function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [stats, setStats] = useState(emptyDashboard);
   const [online, setOnline] = useState(false);
+  const [databaseAvailable, setDatabaseAvailable] = useState<boolean | null>(null);
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [needsSetup, setNeedsSetup] = useState(false);
   const [authReady, setAuthReady] = useState(false);
@@ -246,14 +254,26 @@ function App() {
       fetch("/api/dashboard", { cache: "no-store" }),
     ])
       .then(async ([h, d]) => {
-        setOnline(h.ok);
+        const health = h.ok ? await h.json().catch(() => null) : null;
+        const databaseOk = h.ok && health?.status === "ok" && health?.databaseAvailable !== false;
+        setOnline(databaseOk);
+        setDatabaseAvailable(databaseOk);
         if (d.ok) setStats(await d.json());
       })
-      .catch(() => setOnline(false));
+      .catch(() => { setOnline(false); setDatabaseAvailable(false); });
   useEffect(() => {
-    fetch("/api/auth/status")
-      .then((r) => r.json())
+    fetch("/health", { cache: "no-store" })
+      .then(async (r) => r.ok ? r.json() : null)
+      .then((health) => {
+        const available = health?.status === "ok" && health?.databaseAvailable !== false;
+        setDatabaseAvailable(available);
+        setOnline(available);
+        if (!available) { setAuthReady(true); return null; }
+        return fetch("/api/auth/status");
+      })
+      .then((r) => r?.json())
       .then((x) => {
+        if (!x) return;
         setUser(x.user);
         setNeedsSetup(x.needsSetup);
         setAuthReady(true);
@@ -262,6 +282,17 @@ function App() {
       .catch(() => setAuthReady(true));
   }, []);
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      fetch("/health", { cache: "no-store" }).then(async (r) => r.ok ? r.json() : null).then((health) => {
+        const available = health?.status === "ok" && health?.databaseAvailable !== false;
+        if (available && databaseAvailable === false) window.location.reload();
+        setDatabaseAvailable(available);
+        setOnline(available);
+      }).catch(() => { setDatabaseAvailable(false); setOnline(false); });
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [databaseAvailable]);
+  useEffect(() => {
     const onPopState = () => setPage(pageFromLocation());
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -269,7 +300,7 @@ function App() {
   useEffect(() => {
     if (!user || page !== "dashboard") return;
     refresh();
-    const timer = window.setInterval(refresh, 30_000);
+    const timer = window.setInterval(refresh, 120_000);
     return () => window.clearInterval(timer);
   }, [page, user]);
   const navigate = (nextPage: Page) => {
@@ -279,6 +310,8 @@ function App() {
   };
   if (!authReady)
     return <div className="auth-loading">در حال آماده‌سازی سامانه…</div>;
+  if (databaseAvailable === false)
+    return <DatabaseUnavailablePage />;
   if (!user)
     return (
       <AuthPage
@@ -329,6 +362,7 @@ function App() {
                   jobs: "روند ارسال",
                   inbox: "پیام‌های دریافتی",
                   users: "مدیریت کاربران",
+                  transactions: "تراکنش‌های شارژ و مصرف",
                   settings: "تنظیمات",
                 }[page]
               }
@@ -357,6 +391,7 @@ function App() {
           {page === "campaigns" && <CampaignsPage onReuse={(campaign) => { setCampaignSeed(campaign); navigate("send"); }} />}{" "}
           {page === "jobs" && <JobsPage />} {page === "inbox" && <InboxPage />}{" "}
           {page === "users" && user.isAdmin && <UsersPage />}{" "}
+          {page === "transactions" && user.isAdmin && <CreditTransactionsPage />}{" "}
           {page === "settings" && <SettingsPage />}
         </div>
       </section>
@@ -395,6 +430,10 @@ function App() {
   );
 }
 
+function DatabaseUnavailablePage() {
+  return <main className="auth-page"><section className="auth-card database-unavailable"><Brand /><div><span>اختلال زیرساخت</span><h1>ارتباط با پایگاه‌داده قطع است</h1><p>امکان خواندن یا ثبت اطلاعات وجود ندارد. پس از برقراری اتصال، سامانه به‌صورت خودکار دوباره آماده می‌شود.</p></div><button className="primary" onClick={() => window.location.reload()}>بررسی دوباره</button></section></main>;
+}
+
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
     <div className={`brand ${compact ? "compact" : ""}`}>
@@ -420,7 +459,7 @@ function Nav({
       ? "merchants"
       : ["send", "campaigns", "jobs", "inbox"].includes(page)
         ? "sms"
-        : ["users", "settings"].includes(page) ? "system" : null,
+        : ["users", "transactions", "settings"].includes(page) ? "system" : null,
   );
   const item = (id: Page, icon: NavIconName, label: string) => (
     <a key={id} href={pagePaths[id]} className={`nav-child ${page === id ? "active" : ""}`} onClick={(event) => {
@@ -444,7 +483,7 @@ function Nav({
       {item("dashboard", "dashboard", "نمای کلی")}
       {group("merchants", "merchants", "پذیرندگان", <>{item("merchants", "search", "جستجو")}{item("imports", "upload", "ورود اطلاعات پذیرندگان")}</>)}
       {group("sms", "sms", "پیامک", <>{item("send", "send", "ارسال جدید")}{item("campaigns", "campaigns", "مدیریت کمپین‌ها")}{item("jobs", "jobs", "روند ارسال")}{item("inbox", "inbox", "پیام‌های دریافتی")}</>)}
-      {group("system", "system", "مدیریت سیستم", <>{isAdmin && item("users", "users", "مدیریت کاربران")}{item("settings", "settings", "تنظیمات")}</>)}
+      {group("system", "system", "مدیریت سیستم", <>{isAdmin && item("users", "users", "مدیریت کاربران")}{isAdmin && item("transactions", "transactions", "شارژ و مصرف پیامک")}{item("settings", "settings", "تنظیمات")}</>)}
     </nav>
   );
 }
@@ -462,6 +501,7 @@ function NavIcon({ name }: { name: NavIconName }) {
     issues: <><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 9v4M12 17h.01"/></>,
     system: <><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></>,
     users: <><circle cx="9" cy="8" r="4"/><path d="M2 21v-2a5 5 0 0 1 5-5h4a5 5 0 0 1 5 5v2M17 8h5M19.5 5.5v5"/></>,
+    transactions: <><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="18" cy="17" r="3"/><path d="M18 15.5v3M16.5 17h3"/></>,
     settings: <><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.8-1L14.4 3h-4l-.4 3.1a8 8 0 0 0-1.8 1l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.8 1l.4 3.1h4l.4-3.1a8 8 0 0 0 1.8-1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1Z"/></>,
     chevron: <path d="m7 10 5 5 5-5"/>,
   };
@@ -714,9 +754,10 @@ function DashboardPage({
       </div>
       <section className="stats">
         <Stat
-          label="مخاطبان"
-          value={stats.peopleCount}
-          note="رکورد موجود در دیتابیس"
+          label="موجودی پنل پیامک"
+          value={stats.providerCredit === null ? "نامشخص" : new Intl.NumberFormat("fa-IR", { maximumFractionDigits: 0 }).format(stats.providerCredit)}
+          note={stats.providerCredit === null ? "ارتباط با فراپیامک برقرار نیست" : "ریال"}
+          alert={stats.providerCredit !== null && stats.providerCredit <= 0}
         />
         <Stat
           label="ارسال موفق"
@@ -745,14 +786,14 @@ function Stat({
   alert = false,
 }: {
   label: string;
-  value: number;
+  value: number | string;
   note: string;
   alert?: boolean;
 }) {
   return (
     <article className={`card stat ${alert ? "alert" : ""}`}>
       <span>{label}</span>
-      <strong>{fa(value)}</strong>
+      <strong>{typeof value === "number" ? fa(value) : value}</strong>
       <small>{note}</small>
     </article>
   );
@@ -1643,6 +1684,7 @@ const campaignStatusLabels: Record<string, string> = {
   Draft: "آماده ارسال",
   Active: "در حال ارسال",
   Closed: "پایان‌یافته",
+  Suspended: "متوقف‌شده",
 };
 function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void }) {
   const [items, setItems] = useState<CampaignSummary[]>([]);
@@ -1703,7 +1745,7 @@ function CampaignsPage({ onReuse }: { onReuse: (campaign: CampaignSeed) => void 
     <div className="page-title"><div><span>مدیریت ارسال</span><h1>جست‌وجو و ویرایش کمپین‌ها</h1><p>کمپین را بررسی و ویرایش کنید؛ ارسال فقط با فرمان شما شروع می‌شود.</p></div></div>
     <section className="card campaign-filters">
       <input value={search} onChange={(e)=>setSearch(e.target.value)} onKeyDown={(e)=>e.key==="Enter"&&setAppliedSearch(search.trim())} placeholder="جست‌وجوی عنوان یا متن کمپین" />
-      <select value={status} onChange={(e)=>setStatus(e.target.value)}><option value="">همه وضعیت‌ها</option><option value="Draft">آماده ارسال</option><option value="Active">در حال ارسال</option><option value="Closed">پایان‌یافته</option></select>
+      <select value={status} onChange={(e)=>setStatus(e.target.value)}><option value="">همه وضعیت‌ها</option><option value="Draft">آماده ارسال</option><option value="Active">در حال ارسال</option><option value="Suspended">متوقف‌شده</option><option value="Closed">پایان‌یافته</option></select>
       <button className="primary" onClick={()=>setAppliedSearch(search.trim())}>جستجو</button>
       <span>{fa(total)} کمپین</span>
     </section>
@@ -1760,6 +1802,10 @@ function JobsPage() {
     await fetch(`/api/campaigns/${id}/retry-failed`, { method: "POST" });
     load();
   };
+  const resume = async (id: number) => {
+    await fetch(`/api/campaigns/${id}/resume`, { method: "POST" });
+    load();
+  };
   useEffect(() => {
     if (!failedCampaign) return;
     fetch(`/api/campaigns/${failedCampaign.id}/failed-messages?page=${failedPage}&pageSize=${failedPageSize}`)
@@ -1800,6 +1846,7 @@ function JobsPage() {
                 <div className="progress">
                   <i style={{ width: `${percent}%` }} />
                 </div>
+                {x.alert && <p className="job-alert">{x.alert}</p>}
                 <div className="job-stats">
                   <span>
                     کل <b>{fa(x.total)}</b>
@@ -1816,9 +1863,10 @@ function JobsPage() {
                   <span className="bad">
                     خطا <b>{fa(x.failed)}</b>
                   </span>
-                  {x.failed > 0 && (
+                  {x.failed > 0 && x.status !== "Suspended" && (
                     <><button onClick={() => { setFailedCampaign(x); setFailedPage(1); }}>مشاهده خطاها</button><button onClick={() => retry(x.id)}>تلاش مجدد خطاها</button></>
                   )}
+                  {x.status === "Suspended" && <button className="resume-job" onClick={() => resume(x.id)}>ادامه ارسال پس از شارژ</button>}
                 </div>
               </article>
             );
@@ -2117,6 +2165,56 @@ function IssueActions({ issue, onChanged }: { issue: Issue; onChanged: () => voi
     </form></div>}
   </>;
 }
+function CreditTransactionsPage() {
+  const today = new Date();
+  const monthAgo = new Date(today); monthAgo.setDate(monthAgo.getDate() - 30);
+  const localDate = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  const [from, setFrom] = useState(localDate(monthAgo));
+  const [to, setTo] = useState(localDate(today));
+  const [direction, setDirection] = useState("all");
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState({ from: localDate(monthAgo), to: localDate(today), direction: "all", search: "" });
+  const [result, setResult] = useState<CreditTransactionResult>({ items: [], total: 0, page: 1, pageSize: 50, totalCharge: 0, totalConsumption: 0 });
+  const [page, setPage] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const load = async (targetPage = page, filters = query) => {
+    setBusy(true); setError("");
+    const params = new URLSearchParams({ fromUtc: new Date(`${filters.from}T00:00:00`).toISOString(), toUtc: new Date(`${filters.to}T23:59:59.999`).toISOString(), direction: filters.direction, search: filters.search, page: String(targetPage), pageSize: "50" });
+    try {
+      const response = await fetch(`/api/system/credit-transactions?${params}`, { cache: "no-store" });
+      if (!response.ok) { const body = await response.json().catch(() => null); throw new Error(body?.message ?? "دریافت تراکنش‌ها ناموفق بود."); }
+      setResult(await response.json()); setPage(targetPage);
+    } catch (x) { setError(x instanceof Error ? x.message : "دریافت تراکنش‌ها ناموفق بود."); }
+    finally { setBusy(false); }
+  };
+  useEffect(() => { load(1, query); }, []);
+  const submit = (event: FormEvent) => { event.preventDefault(); const next = { from, to, direction, search: search.trim() }; setQuery(next); load(1, next); };
+  const money = (value?: number) => value === undefined ? "—" : new Intl.NumberFormat("fa-IR", { maximumFractionDigits: 0 }).format(value);
+  const dateTime = (value: string) => new Intl.DateTimeFormat("fa-IR-u-ca-persian", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
+  const pageCount = Math.max(1, Math.ceil(result.total / result.pageSize));
+  return <>
+    <div className="page-title"><div><span>مالی و مصرف</span><h1>تراکنش‌های شارژ و مصرف پیامک</h1><p>سوابق افزایش اعتبار و هزینه‌های ثبت‌شده در پنل فراپیامک را مشاهده کنید.</p></div></div>
+    <section className="transaction-summary">
+      <Stat label="موجودی ثبت‌شده" value={money(result.currentCredit)} note="ریال" />
+      <Stat label="مجموع شارژ در بازه" value={money(result.totalCharge)} note="ریال" />
+      <Stat label="مجموع مصرف در بازه" value={money(result.totalConsumption)} note="ریال" />
+    </section>
+    <form className="card transaction-filters" onSubmit={submit}>
+      <label><span>از تاریخ</span><input type="date" required value={from} onChange={(e) => setFrom(e.target.value)} /></label>
+      <label><span>تا تاریخ</span><input type="date" required value={to} onChange={(e) => setTo(e.target.value)} /></label>
+      <label><span>نوع تراکنش</span><select value={direction} onChange={(e) => setDirection(e.target.value)}><option value="all">همه</option><option value="charge">افزایش اعتبار</option><option value="consume">مصرف</option></select></label>
+      <label><span>شرح یا کد ارسال</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="جستجو" /></label>
+      <button className="primary" disabled={busy}>{busy ? "در حال دریافت…" : "جستجو"}</button>
+    </form>
+    {error && <p className="form-error transaction-error">{error}</p>}
+    <section className="card transaction-table"><div className="table-scroll"><table className="history-table"><thead><tr><th>تاریخ</th><th>نوع</th><th>مبلغ</th><th>مانده</th><th>شرح</th><th>کد ارسال</th></tr></thead><tbody>
+      {!busy && result.items.length === 0 && <tr><td colSpan={6} className="transaction-empty">تراکنشی در این بازه یافت نشد.</td></tr>}
+      {result.items.map((item) => <tr key={item.id}><td>{dateTime(item.transactedAtUtc)}</td><td><em className={`status ${item.amount >= 0 ? "status-completed" : "status-failed"}`}>{item.amount >= 0 ? "افزایش اعتبار" : "مصرف"}</em></td><td className={item.amount >= 0 ? "transaction-positive" : "transaction-negative"}>{item.amount >= 0 ? "+" : "−"}{money(Math.abs(item.amount))}</td><td>{money(item.remainingCredit)}</td><td>{item.description || "—"}</td><td dir="ltr">{item.sendCode || "—"}</td></tr>)}
+    </tbody></table></div><div className="pagination"><button disabled={page <= 1 || busy} onClick={() => load(page - 1)}>قبلی</button><span>صفحه {fa(page)} از {fa(pageCount)} · {fa(result.total)} تراکنش</span><button disabled={page >= pageCount || busy} onClick={() => load(page + 1)}>بعدی</button></div></section>
+  </>;
+}
+
 function SettingsPage() {
   return (
     <>

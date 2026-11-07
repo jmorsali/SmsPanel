@@ -52,6 +52,38 @@ public sealed class MessagingTests
         Assert.Equal("application/json", handler.ContentType);
     }
 
+    [Fact]
+    public async Task Send_recognizes_provider_code_two_as_insufficient_credit()
+    {
+        const string json = """
+        {"MyBase":{"Value":"2","RetStatus":2,"StrRetStatus":"InvalidData"},"Data":2}
+        """;
+        var client = CreateClient(new RecordingHandler(json));
+
+        var result = await client.SendAsync(["09120000000"], "پیام آزمایشی", CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.True(result.IsInsufficientCredit);
+        Assert.Contains("اعتبار", result.ErrorMessage);
+        Assert.DoesNotContain("InvalidData", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Credit_reads_numeric_value_from_current_envelope()
+    {
+        const string json = """
+        {"MyBase":{"Value":"0","RetStatus":1,"StrRetStatus":"Ok"},"Data":123456.75}
+        """;
+        var handler = new RecordingHandler(json);
+        var client = CreateClient(handler);
+
+        var credit = await client.GetCreditAsync(CancellationToken.None);
+
+        Assert.Equal(123456.75m, credit);
+        Assert.Equal("application/x-www-form-urlencoded", handler.ContentType);
+        Assert.Contains("UserName=synthetic-user", handler.Body);
+    }
+
     private static FarapayamakClient CreateClient(HttpMessageHandler handler) => new(
         new HttpClient(handler),
         Options.Create(new FarapayamakOptions { Username = "synthetic-user", Password = "synthetic-password", FromNumber = "20000000" }),

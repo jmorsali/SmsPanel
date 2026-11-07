@@ -1,12 +1,23 @@
 using System.Text.Json;
 using System.Net.Http.Json;
+using System.Xml.Linq;
 using Microsoft.Extensions.Options;
 namespace SmsPanel.Api.Services;
 
 public sealed class FarapayamakOptions { public string BaseUrl { get; set; } = "https://rest.payamak-panel.com/api/SendSMS/"; public string Username { get; set; } = ""; public string Password { get; set; } = ""; public string FromNumber { get; set; } = ""; public bool PollingEnabled { get; set; } = true; public int PollingIntervalMinutes { get; set; } = 1; public int InboxPageSize { get; set; } = 100; public int SendBatchSize { get; set; } = 100; public int SendConcurrency { get; set; } = 5; }
-public sealed record ProviderResponse(string Value, int RetStatus, string? StrRetStatus) { public bool IsSuccess => RetStatus == 1; }
+public sealed record ProviderResponse(string Value, int RetStatus, string? StrRetStatus)
+{
+    public bool IsSuccess => RetStatus == 1;
+    public bool IsInsufficientCredit => !IsSuccess && Value.Trim() == "2";
+    public string ErrorMessage => IsInsufficientCredit
+        ? "اعتبار پنل پیامک کافی نیست؛ ارسال متوقف شد. پس از افزایش اعتبار، ادامه ارسال را بزنید."
+        : Value.Trim() == "7"
+            ? "متن پیام توسط فیلتر سرویس رد شد."
+            : StrRetStatus ?? $"خطای سرویس پیامک ({Value})";
+}
 public sealed record ProviderInboundMessage(string Id, string Sender, string? Receiver, string Text, DateTimeOffset ReceivedAtUtc);
-public interface IFarapayamakClient { Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token); Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token); }
+public sealed record ProviderCreditTransaction(long Id, decimal Amount, decimal RemainingCredit, DateTimeOffset TransactedAtUtc, string? Description, int Type, long SendCode);
+public interface IFarapayamakClient { Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token); Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token); Task<decimal> GetCreditAsync(CancellationToken token); Task<IReadOnlyList<ProviderCreditTransaction>> GetCreditTransactionsAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken token); }
 public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptions> settings, ILogger<FarapayamakClient> log, InboundTextDecoder textDecoder) : IFarapayamakClient
 {
     private readonly FarapayamakOptions o = settings.Value;
@@ -14,6 +25,54 @@ public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptio
     {
         var envelope = await Post("SendSMS", new() { ["username"] = o.Username, ["password"] = o.Password, ["from"] = o.FromNumber, ["to"] = string.Join(",", recipients), ["text"] = text, ["isFlash"] = false }, token, formEncoded: true);
         return envelope.Response;
+    }
+    public async Task<decimal> GetCreditAsync(CancellationToken token)
+    {
+        var envelope = await Post("GetCredit", new() { ["UserName"] = o.Username, ["PassWord"] = o.Password }, token, formEncoded: true);
+        if (!envelope.Response.IsSuccess) throw new InvalidOperationException(envelope.Response.ErrorMessage);
+        if (!decimal.TryParse(envelope.Response.Value, System.Globalization.NumberStyles.Number | System.Globalization.NumberStyles.AllowExponent, System.Globalization.CultureInfo.InvariantCulture, out var credit))
+            throw new InvalidOperationException("موجودی برگشتی فراپیامک قابل خواندن نیست.");
+        return credit;
+    }
+    public async Task<IReadOnlyList<ProviderCreditTransaction>> GetCreditTransactionsAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken token)
+    {
+        const int batchSize = 100;
+        const int maximumRows = 10_000;
+        var result = new List<ProviderCreditTransaction>();
+        var serviceNamespace = XName.Get("GetUserTransactions2", "http://tempuri.org/").Namespace;
+        for (var index = 0; index < maximumRows; index += batchSize)
+        {
+            var envelope = new XDocument(
+                new XElement(XName.Get("Envelope", "http://schemas.xmlsoap.org/soap/envelope/"),
+                    new XElement(XName.Get("Body", "http://schemas.xmlsoap.org/soap/envelope/"),
+                        new XElement(serviceNamespace + "GetUserTransactions2",
+                            new XElement(serviceNamespace + "username", o.Username), new XElement(serviceNamespace + "password", o.Password), new XElement(serviceNamespace + "targetUsername", o.Username),
+                            new XElement(serviceNamespace + "creditType", "All"), new XElement(serviceNamespace + "dateFrom", fromUtc.UtcDateTime.ToString("O")), new XElement(serviceNamespace + "dateTo", toUtc.UtcDateTime.ToString("O")),
+                            new XElement(serviceNamespace + "count", batchSize), new XElement(serviceNamespace + "index", index)))));
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.payamak-panel.com/post/users.asmx");
+            request.Headers.Add("SOAPAction", "\"http://tempuri.org/GetUserTransactions2\"");
+            request.Content = new StringContent(envelope.ToString(SaveOptions.DisableFormatting), System.Text.Encoding.UTF8, "text/xml");
+            using var response = await http.SendAsync(request, token);
+            response.EnsureSuccessStatusCode();
+            var document = XDocument.Parse(await response.Content.ReadAsStringAsync(token));
+            var rows = document.Descendants().Where(x => x.Name.LocalName == "CreditList").Select(ParseCreditTransaction).ToList();
+            result.AddRange(rows);
+            if (rows.Count < batchSize) break;
+        }
+        return result;
+    }
+
+    private static ProviderCreditTransaction ParseCreditTransaction(XElement row)
+    {
+        string Value(string name) => row.Elements().FirstOrDefault(x => x.Name.LocalName == name)?.Value ?? string.Empty;
+        return new ProviderCreditTransaction(
+            long.Parse(Value("CreditID"), System.Globalization.CultureInfo.InvariantCulture),
+            decimal.Parse(Value("CreditAmount"), System.Globalization.CultureInfo.InvariantCulture),
+            decimal.Parse(Value("CreditRemain"), System.Globalization.CultureInfo.InvariantCulture),
+            DateTimeOffset.Parse(Value("TransactDate"), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeLocal).ToUniversalTime(),
+            string.IsNullOrWhiteSpace(Value("Description")) ? null : Value("Description").Trim(),
+            int.Parse(Value("CreditType"), System.Globalization.CultureInfo.InvariantCulture),
+            long.TryParse(Value("SendCode"), out var sendCode) ? sendCode : 0);
     }
     public async Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token)
     {
