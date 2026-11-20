@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using System.Security.Cryptography;
 using ClosedXML.Excel;
 using System.Security.Claims;
@@ -11,11 +12,13 @@ using SmsPanel.Api.Data;
 using SmsPanel.Api.Domain;
 using SmsPanel.Api.Services;
 
+const int SmsTextLimit = 600;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.Configure<FarapayamakOptions>(builder.Configuration.GetSection("Farapayamak"));
 builder.Services.AddDbContext<SmsDbContext>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("SmsDatabase"), s => s.EnableRetryOnFailure()));
 builder.Services.AddHttpClient<IFarapayamakClient, FarapayamakClient>();
+builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IbanService>();
 builder.Services.AddSingleton<BankCardService>();
 builder.Services.AddSingleton<SamanCardToIbanService>();
@@ -25,11 +28,13 @@ builder.Services.AddSingleton<BsiCardToIbanService>();
 builder.Services.AddSingleton<MellatCardToIbanService>();
 builder.Services.AddSingleton<RefahCardToIbanService>();
 builder.Services.AddSingleton<IbanOwnershipVerificationService>();
+builder.Services.AddSingleton<IIbanOwnershipVerificationService>(services => services.GetRequiredService<IbanOwnershipVerificationService>());
 builder.Services.AddSingleton<MobileNormalizer>();
 builder.Services.AddSingleton<MessageTemplateRenderer>();
 builder.Services.AddSingleton<InboundTextDecoder>();
 builder.Services.AddSingleton<PersianPersonNameParser>();
 builder.Services.AddScoped<InboundMessageProcessor>();
+builder.Services.AddScoped<MerchantCampaignRecipients>();
 builder.Services.AddScoped<InboundPersonNameResolver>();
 builder.Services.AddHostedService<ExistingPersonNameSplitWorker>();
 builder.Services.AddHostedService<InboxPollingWorker>();
@@ -85,13 +90,35 @@ app.MapGet("/api/dashboard", async (HttpContext context, SmsDbContext db, IFarap
         await db.ReconciliationIssues.CountAsync(x => x.Status == IssueStatus.Open, token),
         providerCredit));
 });
-app.MapGet("/api/system/credit-transactions", async (DateTimeOffset? fromUtc, DateTimeOffset? toUtc, string? direction, string? search, int? page, int? pageSize, IFarapayamakClient farapayamak, CancellationToken token) =>
+app.MapGet("/api/system/credit-transactions", async (DateTimeOffset? fromUtc, DateTimeOffset? toUtc, string? direction, string? search, int? page, int? pageSize, IFarapayamakClient farapayamak, IMemoryCache cache, CancellationToken token) =>
 {
     var to = toUtc ?? DateTimeOffset.UtcNow;
     var from = fromUtc ?? to.AddDays(-30);
     if (from >= to) return Results.BadRequest(new { message = "تاریخ شروع باید قبل از تاریخ پایان باشد." });
     if (to - from > TimeSpan.FromDays(366)) return Results.BadRequest(new { message = "حداکثر بازه قابل گزارش یک سال است." });
-    var transactions = await farapayamak.GetCreditTransactionsAsync(from, to, token);
+    IReadOnlyList<ProviderCreditTransaction> transactions;
+    ProviderCreditTransaction? latest;
+    try
+    {
+        var reportTask = cache.GetOrCreateAsync(("credit-transactions", from, to), entry =>
+        {
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2);
+            return farapayamak.GetCreditTransactionsAsync(from, to, token);
+        });
+        var latestTask = farapayamak.GetLatestCreditTransactionAsync(token);
+        await Task.WhenAll(reportTask, latestTask);
+        transactions = await reportTask ?? [];
+        latest = await latestTask;
+    }
+    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+    {
+        return Results.Json(new { message = "فراپیامک در زمان مقرر پاسخ نداد. دوباره تلاش کنید." }, statusCode: StatusCodes.Status504GatewayTimeout);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or System.Xml.XmlException or InvalidDataException or FormatException or OverflowException)
+    {
+        app.Logger.LogWarning("دریافت گزارش تراکنش از فراپیامک ناموفق بود. نوع خطا {ErrorType}", ex.GetType().Name);
+        return Results.Json(new { message = "دریافت گزارش تراکنش از فراپیامک ناموفق بود. دوباره تلاش کنید." }, statusCode: StatusCodes.Status502BadGateway);
+    }
     IEnumerable<ProviderCreditTransaction> filtered = transactions;
     if (direction == "charge") filtered = filtered.Where(x => x.Amount > 0);
     else if (direction == "consume") filtered = filtered.Where(x => x.Amount < 0);
@@ -104,7 +131,9 @@ app.MapGet("/api/system/credit-transactions", async (DateTimeOffset? fromUtc, Da
         materialized.Count, current, size,
         transactions.Where(x => x.Amount > 0).Sum(x => x.Amount),
         Math.Abs(transactions.Where(x => x.Amount < 0).Sum(x => x.Amount)),
-        transactions.OrderByDescending(x => x.TransactedAtUtc).ThenByDescending(x => x.Id).Select(x => (decimal?)x.RemainingCredit).FirstOrDefault()));
+        latest?.RemainingCredit,
+        transactions.Count >= FarapayamakClient.CreditTransactionLimit ? FarapayamakClient.CreditTransactionLimit : null,
+        latest?.TransactedAtUtc));
 }).RequireAuthorization(p => p.RequireRole("Admin"));
 app.MapGet("/api/templates/fields", (MessageTemplateRenderer renderer) => Results.Ok(renderer.Fields));
 app.MapGet("/api/templates/confirmation-fields", (MessageTemplateRenderer renderer) => Results.Ok(renderer.ConfirmationFields));
@@ -165,44 +194,50 @@ app.MapPost("/api/merchants", async (RequestCreateMerchant request, SmsDbContext
     var merchant = new Merchant { ImportBatchId = manualBatch.Id, TerminalNumber = terminal, NationalId = nationalId, MerchantName = name, Mobile = mobile, Status = request.Status?.Trim(), CurrentIban = request.CurrentIban?.Trim(), Bank = request.Bank?.Trim(), Agency = request.Agency?.Trim(), PersonId = person?.Id, Person = person };
     db.Add(merchant); manualBatch.TotalRows++; manualBatch.ProcessedRows++; manualBatch.InsertedRows++; await db.SaveChangesAsync(token); return Results.Created($"/api/merchants/{merchant.Id}", new { merchant.Id });
 });
-app.MapPost("/api/campaigns", async (RequestCreateCampaign request, SmsDbContext db, MessageTemplateRenderer renderer) =>
+app.MapPost("/api/campaigns", async (RequestCreateCampaign request, SmsDbContext db, MessageTemplateRenderer renderer,
+    MerchantCampaignRecipients recipients, CancellationToken token) =>
 {
-    if (request.EndsAtUtc.HasValue && request.EndsAtUtc <= DateTimeOffset.UtcNow) return Results.BadRequest(new { message = "مهلت دریافت پاسخ باید بعد از زمان فعلی باشد." });
-    var unknownFields = renderer.GetUnknownFields(request.MessageTemplate);
-    if (unknownFields.Count > 0) return Results.BadRequest(new { message = "قالب شامل فیلد ناشناخته است.", unknownFields });
-    if (request.ConfirmationEnabled && string.IsNullOrWhiteSpace(request.ConfirmationTemplate)) return Results.BadRequest(new { message = "برای پیام تأیید، متن پیام را وارد کنید." });
-    var unknownConfirmationFields = renderer.GetUnknownConfirmationFields(request.ConfirmationTemplate ?? string.Empty);
-    if (unknownConfirmationFields.Count > 0) return Results.BadRequest(new { message = "قالب پیام تأیید شامل فیلد ناشناخته است.", unknownFields = unknownConfirmationFields });
-    if (request.InvalidReplyEnabled && string.IsNullOrWhiteSpace(request.InvalidReplyTemplate)) return Results.BadRequest(new { message = "برای پاسخ خودکار نامعتبر، متن پیام را وارد کنید." });
-    var unknownInvalidReplyFields = renderer.GetUnknownInvalidReplyFields(request.InvalidReplyTemplate ?? string.Empty);
-    if (unknownInvalidReplyFields.Count > 0) return Results.BadRequest(new { message = "قالب پاسخ نامعتبر شامل فیلد ناشناخته است.", unknownFields = unknownInvalidReplyFields });
+    if (ValidateCampaign(request, renderer) is { } error) return error;
+    if (request.MerchantImportBatchIds is not null)
+    {
+        MerchantCampaignRecipientSelection selection;
+        try
+        {
+            selection = await recipients.FindAsync(request.MerchantImportBatchIds, token);
+        }
+        catch (InvalidDataException ex)
+        {
+            return Results.BadRequest(new { message = ex.Message });
+        }
+        if (selection.People.Count == 0)
+            return Results.BadRequest(new { message = "در فایل‌های انتخابی مشتری دارای شماره موبایل معتبر و بدون شبای پشتیبان ثبت‌شده یافت نشد." });
+
+        return await SaveDraftCampaignAsync(request, selection.People, db, renderer, token);
+    }
+
     var peopleQuery = db.People.AsNoTracking().AsQueryable();
     var recipientStatuses = request.RecipientStatuses?.Distinct().ToArray() ?? [];
     if (!request.SendToAll && recipientStatuses.Length > 0) peopleQuery = FilterPeopleByRecipientStatuses(peopleQuery, db, recipientStatuses);
     else if (!request.SendToAll) { var ids = request.RecipientIds?.Distinct().ToArray() ?? []; if (ids.Length == 0) return Results.BadRequest(new { message = "حداقل یک مخاطب یا وضعیت را انتخاب کنید." }); peopleQuery = peopleQuery.Where(x => ids.Contains(x.Id)); }
-    var people = await peopleQuery.ToListAsync();
+    var people = await peopleQuery.ToListAsync(token);
     if (people.Count == 0) return Results.BadRequest(new { message = "هیچ مخاطب دارای شماره موبایل برای ارسال انتخاب نشده است." });
     if (!request.SendToAll && recipientStatuses.Length == 0 && people.Count != (request.RecipientIds?.Distinct().Count() ?? 0)) return Results.BadRequest(new { message = "یک یا چند مخاطب انتخابی معتبر نیستند." });
-    var campaign = new Campaign { Name = request.Name.Trim(), MessageTemplate = request.MessageTemplate, ConfirmationEnabled = request.ConfirmationEnabled, ConfirmationTemplate = request.ConfirmationEnabled ? request.ConfirmationTemplate?.Trim() : null, InvalidReplyEnabled = request.InvalidReplyEnabled, InvalidReplyTemplate = request.InvalidReplyEnabled ? request.InvalidReplyTemplate?.Trim() : null, StartsAtUtc = DateTimeOffset.UtcNow, EndsAtUtc = request.EndsAtUtc, Status = CampaignStatus.Draft };
-    db.Campaigns.Add(campaign);
-    await db.SaveChangesAsync();
-    var personIds = people.Select(x => x.Id).ToArray();
-    var merchantBanks = await db.Merchants.AsNoTracking()
-        .Where(x => x.PersonId.HasValue && personIds.Contains(x.PersonId.Value) && x.Bank != null && x.Bank != "")
-        .OrderByDescending(x => x.Id)
-        .Select(x => new { PersonId = x.PersonId!.Value, x.Bank })
-        .ToListAsync();
-    var bankByPerson = merchantBanks.GroupBy(x => x.PersonId).ToDictionary(x => x.Key, x => x.First().Bank);
-    db.OutboundMessages.AddRange(people.Select(person => new OutboundMessage
-    {
-        CampaignId = campaign.Id,
-        PersonId = person.Id,
-        RenderedText = renderer.Render(request.MessageTemplate, person, bankByPerson.GetValueOrDefault(person.Id)),
-        Status = OutboundStatus.Pending
-    }));
-    await db.SaveChangesAsync();
-    return Results.Created($"/api/campaigns/{campaign.Id}", new { campaign.Id, recipientCount = people.Count });
+    return await SaveDraftCampaignAsync(request, people, db, renderer, token);
 });
+app.MapPost("/api/campaigns/merchant-files/preview", async (RequestPreviewMerchantCampaign request, MerchantCampaignRecipients recipients, CancellationToken token) =>
+{
+    try
+    {
+        var selection = await recipients.FindAsync(request.MerchantImportBatchIds, token);
+        return Results.Ok(new ResponsePreviewMerchantCampaign(selection.UniqueIdentifierCount, selection.People.Count,
+            selection.UnmatchedCount, selection.WithBackupIbanCount, selection.WithoutMobileCount));
+    }
+    catch (InvalidDataException ex)
+    {
+        return Results.BadRequest(new { message = ex.Message });
+    }
+});
+
 app.MapGet("/api/campaigns/recipient-status-counts", async (SmsDbContext db, CancellationToken token) =>
 {
     var counts = new List<object>();
@@ -240,9 +275,8 @@ app.MapPatch("/api/campaigns/{id:long}", async (long id, RequestUpdateCampaign r
     if (await db.OutboundMessages.AnyAsync(x => x.CampaignId == id && (x.Status == OutboundStatus.Sent || x.Status == OutboundStatus.Processing), token)) return Results.Conflict(new { message = "کمپینی که ارسال آن شروع شده است قابل ویرایش نیست." });
     var messages = await db.OutboundMessages.Where(x => x.CampaignId == id).ToListAsync(token);
     var personIds = messages.Select(x => x.PersonId).ToArray();
-    var people = await db.People.Where(x => personIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, token);
-    var merchantBanks = await db.Merchants.AsNoTracking().Where(x => x.PersonId.HasValue && personIds.Contains(x.PersonId.Value) && x.Bank != null && x.Bank != "").OrderByDescending(x => x.Id).Select(x => new { PersonId = x.PersonId!.Value, x.Bank }).ToListAsync(token);
-    var bankByPerson = merchantBanks.GroupBy(x => x.PersonId).ToDictionary(x => x.Key, x => x.First().Bank);
+    var people = await db.People.Where(x => EF.Parameter(personIds).Contains(x.Id)).ToDictionaryAsync(x => x.Id, token);
+    var bankByPerson = await LoadBankByPersonAsync(db, personIds, token);
     campaign.Name = request.Name.Trim(); campaign.MessageTemplate = request.MessageTemplate; campaign.EndsAtUtc = request.EndsAtUtc; campaign.ConfirmationEnabled = request.ConfirmationEnabled; campaign.ConfirmationTemplate = request.ConfirmationEnabled ? request.ConfirmationTemplate?.Trim() : null; campaign.InvalidReplyEnabled = request.InvalidReplyEnabled; campaign.InvalidReplyTemplate = request.InvalidReplyEnabled ? request.InvalidReplyTemplate?.Trim() : null; campaign.Status = CampaignStatus.Draft;
     foreach (var message in messages) { message.RenderedText = renderer.Render(request.MessageTemplate, people[message.PersonId], bankByPerson.GetValueOrDefault(message.PersonId)); message.Status = OutboundStatus.Pending; message.AttemptCount = 0; message.ProviderReference = null; message.LastError = null; message.SentAtUtc = null; }
     await db.SaveChangesAsync(token); return Results.Ok(new ResponseUpdateCampaign(campaign.Id, campaign.Status));
@@ -403,7 +437,7 @@ app.MapPost("/api/reconciliation-issues/{id:long}/card-conversion/complete", asy
 app.MapPost("/api/reconciliation-issues/{id:long}/send-message", async (long id, RequestSendReconciliationIssueMessage request, ClaimsPrincipal principal, SmsDbContext db, MobileNormalizer mobiles, IFarapayamakClient client, CancellationToken token) =>
 {
     var text = request.Text?.Trim() ?? string.Empty;
-    if (text.Length == 0 || text.Length > 500) return Results.BadRequest(new { message = "متن پیام باید بین ۱ تا ۵۰۰ نویسه باشد." });
+    if (text.Length == 0 || text.Length > SmsTextLimit) return Results.BadRequest(new { message = "متن پیام باید بین ۱ تا ۶۰۰ نویسه باشد." });
     var issue = await db.ReconciliationIssues.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id && x.Status == IssueStatus.Open, token);
     if (issue is null) return Results.NotFound(new { message = "مغایرت باز یافت نشد یا قبلاً نهایی شده است." });
     string mobile;
@@ -500,7 +534,7 @@ app.MapGet("/api/inbound-messages/bulk-recipient-count", async (string? search, 
 app.MapPost("/api/inbound-messages/bulk-message", async (RequestBulkInboundMessage request, SmsDbContext db, CancellationToken token) =>
 {
     var text = request.Text?.Trim() ?? string.Empty;
-    if (text.Length == 0 || text.Length > 500) return Results.BadRequest(new { message = "متن پیام باید بین ۱ تا ۵۰۰ نویسه باشد." });
+    if (text.Length == 0 || text.Length > SmsTextLimit) return Results.BadRequest(new { message = "متن پیام باید بین ۱ تا ۶۰۰ نویسه باشد." });
     var query = ApplyInboundMessageFilters(db.InboundMessages.AsNoTracking(), db, request.Search, request.Status, request.IssueType, request.CampaignId, request.FromUtc);
     var (people, uniqueMobileCount) = await FindEligibleInboundRecipients(query, db, token);
     if (people.Count == 0) return Results.BadRequest(new { message = "در نتایج فعلی مخاطب یکتای قابل‌ارسالی یافت نشد." });
@@ -599,6 +633,74 @@ static async Task<(List<Person> People, int UniqueMobileCount)> FindEligibleInbo
     return (people, mobiles.Count);
 }
 
+static IResult? ValidateCampaign(RequestCreateCampaign request, MessageTemplateRenderer renderer)
+{
+    if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.MessageTemplate))
+        return Results.BadRequest(new { message = "عنوان و متن کمپین الزامی است." });
+    if (request.EndsAtUtc.HasValue && request.EndsAtUtc <= DateTimeOffset.UtcNow) return Results.BadRequest(new { message = "مهلت دریافت پاسخ باید بعد از زمان فعلی باشد." });
+    var unknownFields = renderer.GetUnknownFields(request.MessageTemplate);
+    if (unknownFields.Count > 0) return Results.BadRequest(new { message = "قالب شامل فیلد ناشناخته است.", unknownFields });
+    if (request.ConfirmationEnabled && string.IsNullOrWhiteSpace(request.ConfirmationTemplate)) return Results.BadRequest(new { message = "برای پیام تأیید، متن پیام را وارد کنید." });
+    var unknownConfirmationFields = renderer.GetUnknownConfirmationFields(request.ConfirmationTemplate ?? string.Empty);
+    if (unknownConfirmationFields.Count > 0) return Results.BadRequest(new { message = "قالب پیام تأیید شامل فیلد ناشناخته است.", unknownFields = unknownConfirmationFields });
+    if (request.InvalidReplyEnabled && string.IsNullOrWhiteSpace(request.InvalidReplyTemplate)) return Results.BadRequest(new { message = "برای پاسخ خودکار نامعتبر، متن پیام را وارد کنید." });
+    var unknownInvalidReplyFields = renderer.GetUnknownInvalidReplyFields(request.InvalidReplyTemplate ?? string.Empty);
+    if (unknownInvalidReplyFields.Count > 0) return Results.BadRequest(new { message = "قالب پاسخ نامعتبر شامل فیلد ناشناخته است.", unknownFields = unknownInvalidReplyFields });
+    return null;
+}
+
+static async Task<IResult> SaveDraftCampaignAsync(RequestCreateCampaign request, IReadOnlyList<Person> people,
+    SmsDbContext db, MessageTemplateRenderer renderer, CancellationToken token)
+{
+    var personIds = people.Select(x => x.Id).ToArray();
+    long campaignId = 0;
+    await db.Database.CreateExecutionStrategy().ExecuteInTransactionAsync(
+        operation: async cancellationToken =>
+        {
+            campaignId = 0;
+            db.ChangeTracker.Clear();
+            var bankByPerson = await LoadBankByPersonAsync(db, personIds, cancellationToken);
+
+            var campaign = new Campaign
+            {
+                Name = request.Name.Trim(),
+                MessageTemplate = request.MessageTemplate,
+                ConfirmationEnabled = request.ConfirmationEnabled,
+                ConfirmationTemplate = request.ConfirmationEnabled ? request.ConfirmationTemplate?.Trim() : null,
+                InvalidReplyEnabled = request.InvalidReplyEnabled,
+                InvalidReplyTemplate = request.InvalidReplyEnabled ? request.InvalidReplyTemplate?.Trim() : null,
+                StartsAtUtc = DateTimeOffset.UtcNow,
+                EndsAtUtc = request.EndsAtUtc,
+                Status = CampaignStatus.Draft
+            };
+            db.Campaigns.Add(campaign);
+            await db.SaveChangesAsync(cancellationToken);
+            db.OutboundMessages.AddRange(people.Select(person => new OutboundMessage
+            {
+                CampaignId = campaign.Id,
+                PersonId = person.Id,
+                RenderedText = renderer.Render(request.MessageTemplate, person, bankByPerson.GetValueOrDefault(person.Id)),
+                Status = OutboundStatus.Pending
+            }));
+            await db.SaveChangesAsync(cancellationToken);
+            campaignId = campaign.Id;
+        },
+        verifySucceeded: cancellationToken => db.Campaigns.AnyAsync(x => x.Id == campaignId, cancellationToken),
+        cancellationToken: token);
+
+    return Results.Created($"/api/campaigns/{campaignId}", new ResponseCreateCampaign(campaignId, people.Count));
+}
+
+static async Task<Dictionary<long, string?>> LoadBankByPersonAsync(SmsDbContext db, long[] personIds, CancellationToken token)
+{
+    var merchantBanks = await db.Merchants.AsNoTracking()
+        .Where(x => x.PersonId.HasValue && EF.Parameter(personIds).Contains(x.PersonId.Value) && x.Bank != null && x.Bank != "")
+        .OrderByDescending(x => x.Id)
+        .Select(x => new { PersonId = x.PersonId!.Value, x.Bank })
+        .ToListAsync(token);
+    return merchantBanks.GroupBy(x => x.PersonId).ToDictionary(x => x.Key, x => x.First().Bank);
+}
+
 static IQueryable<Person> FilterPeopleByRecipientStatuses(IQueryable<Person> query, SmsDbContext db, IReadOnlyCollection<CampaignRecipientStatus> statuses)
 {
     var successful = statuses.Contains(CampaignRecipientStatus.Successful);
@@ -660,7 +762,10 @@ static bool NamesMatch(string expected, string actual)
     return PersonNameMatcher.Matches(expected, actual);
 }
 public sealed record PersonInput(string NationalCode, string FirstName, string LastName, string Mobile, string? CurrentIban);
-public sealed record RequestCreateCampaign(string Name, string MessageTemplate, DateTimeOffset? EndsAtUtc = null, bool ConfirmationEnabled = false, string? ConfirmationTemplate = null, bool InvalidReplyEnabled = false, string? InvalidReplyTemplate = null, bool SendToAll = true, IReadOnlyList<long>? RecipientIds = null, IReadOnlyList<CampaignRecipientStatus>? RecipientStatuses = null);
+public sealed record RequestCreateCampaign(string Name, string MessageTemplate, DateTimeOffset? EndsAtUtc = null, bool ConfirmationEnabled = false, string? ConfirmationTemplate = null, bool InvalidReplyEnabled = false, string? InvalidReplyTemplate = null, bool SendToAll = true, IReadOnlyList<long>? RecipientIds = null, IReadOnlyList<CampaignRecipientStatus>? RecipientStatuses = null, IReadOnlyList<long>? MerchantImportBatchIds = null);
+public sealed record RequestPreviewMerchantCampaign(IReadOnlyList<long>? MerchantImportBatchIds);
+public sealed record ResponsePreviewMerchantCampaign(int UniqueIdentifierCount, int RecipientCount, int UnmatchedCount, int WithBackupIbanCount, int WithoutMobileCount);
+public sealed record ResponseCreateCampaign(long Id, int RecipientCount);
 public sealed record RequestUpdateCampaign(string Name, string MessageTemplate, DateTimeOffset? EndsAtUtc = null, bool ConfirmationEnabled = false, string? ConfirmationTemplate = null, bool InvalidReplyEnabled = false, string? InvalidReplyTemplate = null);
 public sealed record ResponseCampaignSummary(long Id, string Name, string MessageTemplate, bool ConfirmationEnabled, string? ConfirmationTemplate, bool InvalidReplyEnabled, string? InvalidReplyTemplate, CampaignStatus Status, DateTimeOffset StartsAtUtc, DateTimeOffset? EndsAtUtc, int RecipientCount, int SentCount, int FailedCount);
 public sealed record ResponseCampaignSearch(IReadOnlyList<ResponseCampaignSummary> Items, int Total, int Page, int PageSize);
@@ -685,7 +790,7 @@ public sealed record ResponsePreviousInboundReply(long Id, string RawText, DateT
 public sealed record ResponseInboundMessage(long Id, string ProviderMessageId, string SenderMobile, string RawText, DateTimeOffset ReceivedAtUtc, ProcessingStatus ProcessingStatus, string? LastError, string? Iban, IssueType? IssueType, string? FullName, string? CurrentIban, string? CurrentBank, long? CampaignId, string? CampaignName, long? IssueId, string? CurrentRegisteredIban, bool? OwnershipVerified, bool CanFinalize, IReadOnlyList<ResponsePreviousInboundReply> PreviousReplies);
 public sealed record ResponseDashboard(int PeopleCount, int ActiveCampaignCount, int SentCount, int ReceivedIbanCount, int OpenIssueCount, decimal? ProviderCredit);
 public sealed record ResponseCreditTransaction(long Id, decimal Amount, decimal RemainingCredit, DateTimeOffset TransactedAtUtc, string? Description, int Type, long SendCode);
-public sealed record ResponseCreditTransactions(IReadOnlyList<ResponseCreditTransaction> Items, int Total, int Page, int PageSize, decimal TotalCharge, decimal TotalConsumption, decimal? CurrentCredit);
+public sealed record ResponseCreditTransactions(IReadOnlyList<ResponseCreditTransaction> Items, int Total, int Page, int PageSize, decimal TotalCharge, decimal TotalConsumption, decimal? CurrentCredit, int? ReportLimit, DateTimeOffset? LatestTransactionAtUtc);
 public sealed record RequestLogin(string Username, string Password);
 public sealed record RequestCreateUser(string Username, string DisplayName, string Password, bool IsAdmin = false);
 public sealed record RequestUserStatus(bool IsActive);

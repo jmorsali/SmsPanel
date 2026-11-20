@@ -116,3 +116,13 @@
 .transaction-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}.transaction-filters{display:grid;grid-template-columns:150px 150px 170px minmax(200px,1fr) auto;gap:12px;align-items:end;padding:18px;margin-bottom:14px}.transaction-filters label{display:grid;gap:6px}.transaction-filters label>span{font-size:10px;color:var(--muted)}.transaction-filters input,.transaction-filters select{min-height:40px;border:1px solid #c2c2c2;border-radius:8px;background:#fff;padding:8px 10px;font:inherit}.transaction-table{overflow:hidden}.transaction-table .history-table{min-width:900px}.transaction-table th{background:var(--blue)}.transaction-table td:first-child{min-width:130px;white-space:nowrap}.transaction-positive{color:#147653;font-weight:700}.transaction-negative{color:#a44135;font-weight:700}.transaction-empty{text-align:center!important;color:var(--muted);padding:30px!important}.transaction-error{padding:10px 13px;border-radius:9px;background:#fff0ed}.database-unavailable{text-align:center}.database-unavailable .brand{justify-content:center}.database-unavailable button{width:100%}
 @media(max-width:1000px){.transaction-filters{grid-template-columns:repeat(2,1fr)}.transaction-filters button{grid-column:1/-1}.transaction-summary{grid-template-columns:1fr 1fr}}
 @media(max-width:600px){.transaction-filters,.transaction-summary{grid-template-columns:1fr}.transaction-filters button{grid-column:auto}}
+.import-history-head{flex-wrap:wrap;gap:10px}
+.import-file-option,.form-card .import-file-option{display:flex;align-items:center;gap:9px;margin:0;min-width:0}
+.import-file-option input[type=checkbox]{width:auto;flex:none}
+.import-file-option>span{min-width:0;overflow-wrap:anywhere}
+.campaign-imports{display:grid;justify-items:start;gap:8px}
+.campaign-imports>fieldset,.campaign-imports>[aria-live]{width:100%;min-width:0}
+.campaign-import-picker{margin:0;padding:9px;border:1px solid #dfe5ec;border-radius:11px}
+.campaign-import-picker legend{font-size:10px}
+.campaign-import-options{display:grid;gap:8px;max-height:180px;overflow:auto}
+.campaign-import-options small{display:block}

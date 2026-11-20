@@ -130,7 +130,9 @@ type ManagedUser = {
   lastLoginAtUtc?: string;
 };
 type CreditTransaction = { id: number; amount: number; remainingCredit: number; transactedAtUtc: string; description?: string; type: number; sendCode: number };
-type CreditTransactionResult = { items: CreditTransaction[]; total: number; page: number; pageSize: number; totalCharge: number; totalConsumption: number; currentCredit?: number };
+type CreditTransactionResult = { items: CreditTransaction[]; total: number; page: number; pageSize: number; totalCharge: number; totalConsumption: number; currentCredit?: number | null; reportLimit?: number | null; latestTransactionAtUtc?: string | null };
+const creditFormatter = new Intl.NumberFormat("fa-IR", { maximumFractionDigits: 2 });
+const formatCredit = (value?: number | null) => value == null ? "—" : creditFormatter.format(value);
 type Merchant = {
   id: number;
   terminalNumber: string;
@@ -190,6 +192,7 @@ const recipientStatusLabels: Record<string, string> = {
   AccountHolderNameMismatch: "نام صاحب حساب با پذیرنده مطابقت ندارد",
 };
 const fa = (value: number) => value.toLocaleString("fa-IR");
+const smsTextLimit = 600;
 const latinDigits = (value: string) =>
   value
     .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
@@ -248,6 +251,7 @@ function App() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [campaignSeed, setCampaignSeed] = useState<CampaignSeed | null>(null);
+  const [campaignImportIds, setCampaignImportIds] = useState<number[]>([]);
   const refresh = () =>
     Promise.all([
       fetch("/health"),
@@ -293,7 +297,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, [databaseAvailable]);
   useEffect(() => {
-    const onPopState = () => setPage(pageFromLocation());
+    const onPopState = () => { setCampaignImportIds([]); setPage(pageFromLocation()); };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -303,9 +307,10 @@ function App() {
     const timer = window.setInterval(refresh, 120_000);
     return () => window.clearInterval(timer);
   }, [page, user]);
-  const navigate = (nextPage: Page) => {
+  const navigate = (nextPage: Page, importIds: number[] = []) => {
     const path = pagePaths[nextPage];
     if (window.location.pathname !== path) window.history.pushState({}, "", path);
+    setCampaignImportIds(importIds);
     setPage(nextPage);
   };
   if (!authReady)
@@ -375,12 +380,13 @@ function App() {
           {page === "dashboard" && (
             <DashboardPage stats={stats} goSend={() => navigate("send")} />
           )}{" "}
-          {page === "imports" && <ImportsPage />}{" "}
+          {page === "imports" && <ImportsPage onCreateCampaign={(ids) => { setCampaignSeed(null); navigate("send", ids); }} />}{" "}
           {page === "merchants" && <MerchantsPage />}{" "}
           {page === "send" && (
             <SendPage
               peopleCount={stats.peopleCount}
               seed={campaignSeed}
+              initialImportIds={campaignImportIds}
               onCreated={() => {
                 setCampaignSeed(null);
                 refresh();
@@ -798,13 +804,23 @@ function Stat({
     </article>
   );
 }
+type MerchantFilePreview = {
+  uniqueIdentifierCount: number;
+  recipientCount: number;
+  unmatchedCount: number;
+  withBackupIbanCount: number;
+  withoutMobileCount: number;
+};
+
 function SendPage({
   peopleCount,
   seed,
+  initialImportIds,
   onCreated,
 }: {
   peopleCount: number;
   seed: CampaignSeed | null;
+  initialImportIds: number[];
   onCreated: () => void;
 }) {
   const [availablePeopleCount, setAvailablePeopleCount] = useState(peopleCount);
@@ -817,7 +833,12 @@ function SendPage({
   const [confirmationEnabled, setConfirmationEnabled] = useState(seed?.confirmationEnabled ?? false);
   const [invalidReplyEnabled, setInvalidReplyEnabled] = useState(seed?.invalidReplyEnabled ?? false);
   const [invalidReplyMessage, setInvalidReplyMessage] = useState(seed?.invalidReplyTemplate ?? "پاسخ شما قابل ثبت نبود: {{دلیل_نامعتبر_بودن}}. لطفاً شماره شبای صحیح را دوباره ارسال کنید.");
-  const [recipientMode, setRecipientMode] = useState<"all" | "selected" | "status">("all");
+  const [recipientMode, setRecipientMode] = useState<"all" | "selected" | "status" | "merchantFile">(initialImportIds.length ? "merchantFile" : "all");
+  const [merchantImportIds, setMerchantImportIds] = useState(initialImportIds);
+  const [completedImports, setCompletedImports] = useState<ImportBatch[] | null>(null);
+  const [importListError, setImportListError] = useState("");
+  const [merchantFilePreview, setMerchantFilePreview] = useState<MerchantFilePreview | null>(null);
+  const [merchantFileError, setMerchantFileError] = useState("");
   const [selectedRecipients, setSelectedRecipients] = useState<Recipient[]>([]);
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
   const [recipientStatusCounts, setRecipientStatusCounts] = useState<RecipientStatusCount[]>([]);
@@ -887,6 +908,43 @@ function SendPage({
     }, 250);
     return () => clearTimeout(timer);
   }, [recipientPickerOpen, recipientQuery]);
+  useEffect(() => {
+    if (recipientMode !== "merchantFile") return;
+    const controller = new AbortController();
+    fetch("/api/merchant-imports", { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("دریافت فهرست فایل‌ها ناموفق بود.");
+        const imports: ImportBatch[] = await response.json();
+        if (!controller.signal.aborted) {
+          setCompletedImports(imports.filter((batch) => batch.status === "Completed"));
+          setImportListError("");
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setImportListError("دریافت فهرست فایل‌ها ناموفق بود.");
+      });
+    return () => controller.abort();
+  }, [recipientMode]);
+  useEffect(() => {
+    if (merchantImportIds.length === 0) return;
+    const controller = new AbortController();
+    fetch("/api/campaigns/merchant-files/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ merchantImportBatchIds: merchantImportIds }),
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        const result = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(result?.message ?? "بررسی فایل‌های پذیرندگان ناموفق بود.");
+        if (!controller.signal.aborted) setMerchantFilePreview(result);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted)
+          setMerchantFileError(error instanceof Error ? error.message : "بررسی فایل‌های پذیرندگان ناموفق بود.");
+      });
+    return () => controller.abort();
+  }, [merchantImportIds]);
   const insertAtCursor = (
     token: string,
     input: HTMLTextAreaElement | null,
@@ -929,12 +987,25 @@ function SendPage({
   const statusRecipientCount = recipientStatusCounts
     .filter((item) => selectedStatuses.includes(item.status))
     .reduce((sum, item) => sum + item.count, 0);
+  const recipientCount = {
+    all: availablePeopleCount,
+    selected: selectedRecipients.length,
+    status: statusRecipientCount,
+    merchantFile: merchantFilePreview?.recipientCount ?? 0,
+  }[recipientMode];
+  const changeMerchantImports = (ids: number[]) => {
+    setMerchantFilePreview(null);
+    setMerchantFileError("");
+    setMerchantImportIds(ids);
+  };
   const submit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setBusy(true);
     setError("");
     const form = new FormData(e.currentTarget);
     try {
+      if (recipientMode === "merchantFile" && !merchantFilePreview?.recipientCount)
+        throw new Error("فایل‌های انتخاب‌شده باید حداقل یک مخاطب قابل ارسال داشته باشند.");
       const date = String(form.get("endsAtDate")).trim();
       const time = String(form.get("endsAtTime")).trim();
       if ((date && !time) || (!date && time))
@@ -956,6 +1027,7 @@ function SendPage({
             ? selectedRecipients.map((x) => x.id)
             : null,
         recipientStatuses: recipientMode === "status" ? selectedStatuses : null,
+        merchantImportBatchIds: recipientMode === "merchantFile" ? merchantImportIds : null,
       };
       const r = await fetch("/api/campaigns", {
         method: "POST",
@@ -1042,14 +1114,14 @@ function SendPage({
             <textarea
               ref={textRef}
               required
-              maxLength={500}
+              maxLength={smsTextLimit}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               placeholder="متن پیام یا قالب پیام"
             />
             <small>
               برای شخصی‌سازی، نشانگر را در محل دلخواه بگذارید و یک گزینه از «درج
-              اطلاعات مخاطب» انتخاب کنید. · {fa(message.length)} از ۵۰۰ نویسه
+              اطلاعات مخاطب» انتخاب کنید. · {fa(message.length)} از {fa(smsTextLimit)} نویسه
             </small>
           </div>
           <p className="privacy-note">
@@ -1095,7 +1167,54 @@ function SendPage({
                   <small>{fa(statusRecipientCount)} مخاطب در وضعیت‌های انتخابی</small>
                 </span>
               </label>
+              <label className={recipientMode === "merchantFile" ? "active" : ""}>
+                <input
+                  type="radio"
+                  name="recipientMode"
+                  checked={recipientMode === "merchantFile"}
+                  onChange={() => setRecipientMode("merchantFile")}
+                />
+                <span>
+                  <b>فایل‌های پذیرندگان</b>
+                  <small>مشتریان فایل بدون شبای پشتیبان ثبت‌شده</small>
+                </span>
+              </label>
             </div>
+            {recipientMode === "merchantFile" && <div className="campaign-imports">
+              {importListError && <p className="form-error">{importListError}</p>}
+              {!completedImports && !importListError && <small>در حال دریافت فهرست فایل‌ها…</small>}
+              {completedImports?.length === 0 && <small>فایل تکمیل‌شده‌ای در سابقهٔ ورود فایل اکسل وجود ندارد.</small>}
+              {completedImports && completedImports.length > 0 && (
+                <fieldset className="campaign-import-picker" disabled={busy}>
+                  <legend>فایل‌های تکمیل‌شدهٔ ورود اکسل</legend>
+                  <div className="campaign-import-options">
+                    {completedImports.map((batch) => (
+                      <label className="import-file-option" key={batch.id}>
+                        <input type="checkbox" checked={merchantImportIds.includes(batch.id)}
+                          onChange={(event) => changeMerchantImports(event.target.checked
+                            ? [...merchantImportIds, batch.id] : merchantImportIds.filter((id) => id !== batch.id))} />
+                        <span>{batch.originalFileName}<small>{new Date(batch.createdAtUtc).toLocaleString("fa-IR")}</small></span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              )}
+              {merchantImportIds.length > 0 && <button type="button" className="table-action" disabled={busy} onClick={() => changeMerchantImports([])}>پاک‌کردن انتخاب فایل‌ها</button>}
+              <div aria-live="polite">
+                {merchantFileError && <p className="form-error">{merchantFileError}</p>}
+                {merchantImportIds.length > 0 && !merchantFilePreview && !merchantFileError && <small>در حال بررسی فایل‌ها…</small>}
+                {merchantFilePreview && (
+                  <div className="status-selection-summary">
+                    <div>
+                      <b>{fa(merchantFilePreview.recipientCount)} مخاطب قابل ارسال از {fa(merchantFilePreview.uniqueIdentifierCount)} شناسهٔ یکتا</b>
+                      <small>
+                        {fa(merchantFilePreview.withBackupIbanCount)} دارای شبای پشتیبان · {fa(merchantFilePreview.withoutMobileCount)} فاقد موبایل معتبر · {fa(merchantFilePreview.unmatchedCount)} مشتری یافت‌نشده
+                      </small>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>}
             {recipientMode === "selected" && (
               <div className="selected-recipients">
                 <button
@@ -1225,11 +1344,11 @@ function SendPage({
               <textarea
                 ref={confirmationTextRef}
                 required
-                maxLength={500}
+                maxLength={smsTextLimit}
                 value={confirmationMessage}
                 onChange={(e) => setConfirmationMessage(e.target.value)}
               />
-              <small>{fa(confirmationMessage.length)} از ۵۰۰ نویسه</small>
+              <small>{fa(confirmationMessage.length)} از {fa(smsTextLimit)} نویسه</small>
             </div>
           )}
           <label className="check">
@@ -1242,24 +1361,17 @@ function SendPage({
           {invalidReplyEnabled && (
             <div className="template-field confirmation-template">
               <div className="message-heading"><span>متن پاسخ نامعتبر</span></div>
-              <textarea ref={invalidReplyTextRef} required maxLength={500} value={invalidReplyMessage} onChange={(e) => setInvalidReplyMessage(e.target.value)} />
+              <textarea ref={invalidReplyTextRef} required maxLength={smsTextLimit} value={invalidReplyMessage} onChange={(e) => setInvalidReplyMessage(e.target.value)} />
               <div className="field-chips">
                 {invalidReplyFields.map((field) => <button type="button" key={field.name} onClick={() => insertAtCursor(field.token, invalidReplyTextRef.current, invalidReplyMessage, setInvalidReplyMessage)}>{field.label}</button>)}
               </div>
-              <small>{fa(invalidReplyMessage.length)} از ۵۰۰ نویسه</small>
+              <small>{fa(invalidReplyMessage.length)} از {fa(smsTextLimit)} نویسه</small>
             </div>
           )}
           {error && <p className="form-error">{error}</p>}
           <button
             className="primary submit"
-            disabled={
-              busy ||
-              (recipientMode === "all"
-                ? availablePeopleCount === 0
-                : recipientMode === "selected"
-                  ? selectedRecipients.length === 0
-                  : selectedStatuses.length === 0 || statusRecipientCount === 0)
-            }
+            disabled={busy || recipientCount === 0}
           >
             {busy ? "در حال ثبت…" : "ذخیره در وضعیت آماده ارسال"}
           </button>
@@ -1285,15 +1397,7 @@ function SendPage({
           <dl>
             <div>
               <dt>تعداد گیرنده</dt>
-              <dd>
-                {fa(
-                  recipientMode === "all"
-                    ? availablePeopleCount
-                    : recipientMode === "selected"
-                      ? selectedRecipients.length
-                      : statusRecipientCount,
-                )}
-              </dd>
+              <dd>{fa(recipientCount)}</dd>
             </div>
             <div>
               <dt>نوع ارسال</dt>
@@ -1594,8 +1698,9 @@ const importStatus: Record<string, string> = {
   Failed: "ناموفق",
   Invalidated: "ابطال‌شده",
 };
-function ImportsPage() {
+function ImportsPage({ onCreateCampaign }: { onCreateCampaign: (ids: number[]) => void }) {
   const [items, setItems] = useState<ImportBatch[]>([]);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const load = () =>
@@ -1640,6 +1745,7 @@ function ImportsPage() {
     }
     load();
   };
+  const selectedCompletedIds = items.filter((item) => item.status === "Completed" && selectedIds.includes(item.id)).map((item) => item.id);
   return (
     <>
       <div className="page-title">
@@ -1664,11 +1770,25 @@ function ImportsPage() {
       </form>
       {error && <p className="form-error">{error}</p>}
       <section className="card import-history-card">
-        <div className="list-head"><div><b>سابقه فایل‌ها</b><small>وضعیت پردازش و نتیجه هر بارگذاری</small></div><span>{fa(items.length)} فایل</span></div>
+        <div className="list-head import-history-head">
+          <div><b>سابقه فایل‌ها</b><small>برای ایجاد کمپین، یک یا چند فایل تکمیل‌شده را انتخاب کنید.</small></div>
+          <button type="button" className="primary" disabled={selectedCompletedIds.length === 0} onClick={() => onCreateCampaign(selectedCompletedIds)}>
+            ایجاد کمپین از فایل‌های انتخابی{selectedCompletedIds.length > 0 && ` (${fa(selectedCompletedIds.length)})`}
+          </button>
+        </div>
         {items.length === 0 ? <div className="empty"><h3>هنوز فایلی بارگذاری نشده است</h3></div> : (
           <div className="table-scroll"><table className="history-table"><thead><tr><th>فایل و زمان</th><th>وضعیت و پیشرفت</th><th>کل ردیف</th><th>درج‌شده</th><th>تکراری</th><th>نامعتبر</th><th>عملیات</th></tr></thead><tbody>
             {items.map((x) => { const percent=x.totalRows?Math.round(x.processedRows*100/x.totalRows):0; const running=["Queued","Validating","Importing"].includes(x.status); return <tr key={x.id}>
-              <td><b>{x.originalFileName}</b><small>{new Date(x.createdAtUtc).toLocaleString("fa-IR")}</small></td>
+              <td>
+                <label className="import-file-option">
+                  <input type="checkbox" disabled={x.status !== "Completed"} checked={x.status === "Completed" && selectedIds.includes(x.id)}
+                    onChange={(event) => {
+                      const checked = event.target.checked;
+                      setSelectedIds((ids) => checked ? [...ids, x.id] : ids.filter((id) => id !== x.id));
+                    }} />
+                  <span><b>{x.originalFileName}</b><small>{new Date(x.createdAtUtc).toLocaleString("fa-IR")}</small></span>
+                </label>
+              </td>
               <td className="history-status"><em className={`status status-${x.status.toLowerCase()}`}>{importStatus[x.status]??x.status}</em>{running&&<><div className="progress"><i style={{width:`${percent}%`}}/></div><small>{x.currentStage??"در صف پردازش"} — {fa(x.processedRows)} از {fa(x.totalRows)}</small></>}{x.lastError&&<small className="row-error">{x.lastError}</small>}</td>
               <td>{fa(x.totalRows)}</td><td>{fa(x.insertedRows)}</td><td>{fa(x.duplicateRows)}</td><td>{fa(x.invalidRows)}</td>
               <td>{!["Importing","Validating","Queued","Invalidated"].includes(x.status)?<button className="table-action danger" onClick={()=>invalidate(x.id)}>ابطال</button>:<span>—</span>}</td>
@@ -2073,8 +2193,8 @@ function InboxPage() {
         <header><div><h2>ارسال پیام به نتایج جستجو</h2><small>هر شماره موبایل فقط یک‌بار پیام دریافت می‌کند.</small></div><button type="button" onClick={() => !bulkBusy && setBulkOpen(false)}>×</button></header>
         {bulkPreview ? <div className="bulk-preview-stats"><span><b>{fa(bulkPreview.messageCount)}</b><small>پیام منطبق</small></span><span><b>{fa(bulkPreview.uniqueMobileCount)}</b><small>شماره یکتا</small></span><span><b>{fa(bulkPreview.recipientCount)}</b><small>مخاطب قابل ارسال</small></span><span><b>{fa(bulkPreview.skippedCount)}</b><small>غیرقابل ارسال</small></span></div> : <div className="bulk-preview-loading">در حال محاسبه مخاطبان…</div>}
         <label><span>عنوان ارسال</span><input required maxLength={200} value={bulkTitle} onChange={(e) => setBulkTitle(e.target.value)} /></label>
-        <label><span>متن پیام</span><textarea required maxLength={500} value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder="متنی که برای تمام مخاطبان نتیجه جستجو ارسال می‌شود" /></label>
-        <small className="message-cost-note">این عملیات برای هر مخاطب یک پیامک جدید و دارای هزینه ایجاد می‌کند. ارسال پس از تأیید بلافاصله در صف پس‌زمینه آغاز می‌شود. · {fa(bulkText.length)} از ۵۰۰ نویسه</small>
+        <label><span>متن پیام</span><textarea required maxLength={smsTextLimit} value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder="متنی که برای تمام مخاطبان نتیجه جستجو ارسال می‌شود" /></label>
+        <small className="message-cost-note">این عملیات برای هر مخاطب یک پیامک جدید و دارای هزینه ایجاد می‌کند. ارسال پس از تأیید بلافاصله در صف پس‌زمینه آغاز می‌شود. · {fa(bulkText.length)} از {fa(smsTextLimit)} نویسه</small>
         {bulkError && <p className="form-error">{bulkError}</p>}
         <footer><button type="button" onClick={() => !bulkBusy && setBulkOpen(false)}>انصراف</button><button className="primary" disabled={bulkBusy || !bulkPreview || bulkPreview.recipientCount === 0 || !bulkText.trim()}>{bulkBusy ? "در حال ایجاد صف…" : `تأیید و ارسال برای ${fa(bulkPreview?.recipientCount ?? 0)} مخاطب`}</button></footer>
       </form></div>}
@@ -2159,8 +2279,8 @@ function IssueActions({ issue, onChanged }: { issue: Issue; onChanged: () => voi
     {mode === "message" && <div className="modal-backdrop"><form className="campaign-editor finalize-issue-modal" onSubmit={sendMessage}>
       <header><div><h2>ارسال پیام اختصاصی</h2><small>{issue.fullName || issue.senderMobile} · {issue.senderMobile}</small></div><button type="button" onClick={close}>×</button></header>
       <div className="finalize-history"><span><b>پیام دریافتی</b><small>{issue.rawText || "—"}</small></span><span><b>دلیل بررسی</b><small>{issueLabels[issue.issueType] ?? issue.issueType}</small></span></div>
-      <label><span>متن پیام</span><textarea required maxLength={500} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="متن اختصاصی برای این مخاطب" /></label>
-      <small className="message-cost-note">این عملیات یک پیامک جدید ارسال می‌کند و هزینه دارد. · {fa(message.length)} از ۵۰۰ نویسه</small>{error && <p className="form-error">{error}</p>}
+      <label><span>متن پیام</span><textarea required maxLength={smsTextLimit} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="متن اختصاصی برای این مخاطب" /></label>
+      <small className="message-cost-note">این عملیات یک پیامک جدید ارسال می‌کند و هزینه دارد. · {fa(message.length)} از {fa(smsTextLimit)} نویسه</small>{error && <p className="form-error">{error}</p>}
       <footer><button type="button" onClick={close}>انصراف</button><button className="primary" disabled={busy || !message.trim()}>{busy ? "در حال ارسال…" : "تأیید و ارسال پیام"}</button></footer>
     </form></div>}
   </>;
@@ -2168,49 +2288,60 @@ function IssueActions({ issue, onChanged }: { issue: Issue; onChanged: () => voi
 function CreditTransactionsPage() {
   const today = new Date();
   const monthAgo = new Date(today); monthAgo.setDate(monthAgo.getDate() - 30);
-  const localDate = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
-  const [from, setFrom] = useState(localDate(monthAgo));
-  const [to, setTo] = useState(localDate(today));
+  const dateFormatter = new Intl.DateTimeFormat("fa-IR-u-ca-persian", { year: "numeric", month: "2-digit", day: "2-digit" });
+  const [from, setFrom] = useState(dateFormatter.format(monthAgo));
+  const [to, setTo] = useState(dateFormatter.format(today));
   const [direction, setDirection] = useState("all");
   const [search, setSearch] = useState("");
-  const [query, setQuery] = useState({ from: localDate(monthAgo), to: localDate(today), direction: "all", search: "" });
+  const [query, setQuery] = useState({ from, to, direction: "all", search: "" });
   const [result, setResult] = useState<CreditTransactionResult>({ items: [], total: 0, page: 1, pageSize: 50, totalCharge: 0, totalConsumption: 0 });
   const [page, setPage] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const load = async (targetPage = page, filters = query) => {
+  const load = async (targetPage = page, filters = query, signal?: AbortSignal) => {
     setBusy(true); setError("");
-    const params = new URLSearchParams({ fromUtc: new Date(`${filters.from}T00:00:00`).toISOString(), toUtc: new Date(`${filters.to}T23:59:59.999`).toISOString(), direction: filters.direction, search: filters.search, page: String(targetPage), pageSize: "50" });
     try {
-      const response = await fetch(`/api/system/credit-transactions?${params}`, { cache: "no-store" });
+      const fromUtc = jalaliDeadline(filters.from, "00:00");
+      const endMinute = jalaliDeadline(filters.to, "23:59");
+      const toUtc = new Date(Date.parse(endMinute) + 59_999).toISOString();
+      const params = new URLSearchParams({ fromUtc, toUtc, direction: filters.direction, search: filters.search, page: String(targetPage), pageSize: "50" });
+      const response = await fetch(`/api/system/credit-transactions?${params}`, { cache: "no-store", signal });
       if (!response.ok) { const body = await response.json().catch(() => null); throw new Error(body?.message ?? "دریافت تراکنش‌ها ناموفق بود."); }
-      setResult(await response.json()); setPage(targetPage);
-    } catch (x) { setError(x instanceof Error ? x.message : "دریافت تراکنش‌ها ناموفق بود."); }
-    finally { setBusy(false); }
+      const data: CreditTransactionResult = await response.json();
+      if (!signal?.aborted) { setResult(data); setPage(targetPage); }
+    } catch (x) {
+      if (!signal?.aborted) setError(x instanceof Error ? x.message : "دریافت تراکنش‌ها ناموفق بود.");
+    } finally {
+      if (!signal?.aborted) setBusy(false);
+    }
   };
-  useEffect(() => { load(1, query); }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    load(1, query, controller.signal);
+    return () => controller.abort();
+  }, []);
   const submit = (event: FormEvent) => { event.preventDefault(); const next = { from, to, direction, search: search.trim() }; setQuery(next); load(1, next); };
-  const money = (value?: number) => value === undefined ? "—" : new Intl.NumberFormat("fa-IR", { maximumFractionDigits: 0 }).format(value);
   const dateTime = (value: string) => new Intl.DateTimeFormat("fa-IR-u-ca-persian", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
   const pageCount = Math.max(1, Math.ceil(result.total / result.pageSize));
   return <>
     <div className="page-title"><div><span>مالی و مصرف</span><h1>تراکنش‌های شارژ و مصرف پیامک</h1><p>سوابق افزایش اعتبار و هزینه‌های ثبت‌شده در پنل فراپیامک را مشاهده کنید.</p></div></div>
     <section className="transaction-summary">
-      <Stat label="موجودی ثبت‌شده" value={money(result.currentCredit)} note="ریال" />
-      <Stat label="مجموع شارژ در بازه" value={money(result.totalCharge)} note="ریال" />
-      <Stat label="مجموع مصرف در بازه" value={money(result.totalConsumption)} note="ریال" />
+      <Stat label="ماندهٔ آخرین تراکنش" value={formatCredit(result.currentCredit)} note={result.latestTransactionAtUtc ? `واحد اعتبار پیامکی · ${dateTime(result.latestTransactionAtUtc)}` : "واحد اعتبار پیامکی"} />
+      <Stat label="مجموع شارژ در بازه" value={formatCredit(result.totalCharge)} note="واحد اعتبار پیامکی" />
+      <Stat label="مجموع مصرف در بازه" value={formatCredit(result.totalConsumption)} note="واحد اعتبار پیامکی" />
     </section>
     <form className="card transaction-filters" onSubmit={submit}>
-      <label><span>از تاریخ</span><input type="date" required value={from} onChange={(e) => setFrom(e.target.value)} /></label>
-      <label><span>تا تاریخ</span><input type="date" required value={to} onChange={(e) => setTo(e.target.value)} /></label>
+      <label><span>از تاریخ شمسی</span><input type="text" required value={from} placeholder="۱۴۰۵/۰۸/۲۰" onChange={(e) => setFrom(e.target.value)} /></label>
+      <label><span>تا تاریخ شمسی</span><input type="text" required value={to} placeholder="۱۴۰۵/۰۸/۲۹" onChange={(e) => setTo(e.target.value)} /></label>
       <label><span>نوع تراکنش</span><select value={direction} onChange={(e) => setDirection(e.target.value)}><option value="all">همه</option><option value="charge">افزایش اعتبار</option><option value="consume">مصرف</option></select></label>
       <label><span>شرح یا کد ارسال</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="جستجو" /></label>
       <button className="primary" disabled={busy}>{busy ? "در حال دریافت…" : "جستجو"}</button>
     </form>
     {error && <p className="form-error transaction-error">{error}</p>}
-    <section className="card transaction-table"><div className="table-scroll"><table className="history-table"><thead><tr><th>تاریخ</th><th>نوع</th><th>مبلغ</th><th>مانده</th><th>شرح</th><th>کد ارسال</th></tr></thead><tbody>
-      {!busy && result.items.length === 0 && <tr><td colSpan={6} className="transaction-empty">تراکنشی در این بازه یافت نشد.</td></tr>}
-      {result.items.map((item) => <tr key={item.id}><td>{dateTime(item.transactedAtUtc)}</td><td><em className={`status ${item.amount >= 0 ? "status-completed" : "status-failed"}`}>{item.amount >= 0 ? "افزایش اعتبار" : "مصرف"}</em></td><td className={item.amount >= 0 ? "transaction-positive" : "transaction-negative"}>{item.amount >= 0 ? "+" : "−"}{money(Math.abs(item.amount))}</td><td>{money(item.remainingCredit)}</td><td>{item.description || "—"}</td><td dir="ltr">{item.sendCode || "—"}</td></tr>)}
+    {!error && !busy && result.reportLimit && <p role="status">مجموع‌ها بر اساس سقف {fa(result.reportLimit)} تراکنش این گزارش محاسبه شده‌اند. برای گزارش کامل بازهٔ کوتاه‌تری انتخاب کنید.</p>}
+    <section className="card transaction-table"><div className="table-scroll"><table className="history-table"><thead><tr><th>تاریخ</th><th>نوع</th><th>تغییر اعتبار پیامکی</th><th>ماندهٔ اعتبار پیامکی</th><th>شرح</th><th>کد ارسال</th></tr></thead><tbody>
+      {!busy && !error && result.items.length === 0 && <tr><td colSpan={6} className="transaction-empty">تراکنشی در این بازه یافت نشد.</td></tr>}
+      {result.items.map((item) => <tr key={item.id}><td>{dateTime(item.transactedAtUtc)}</td><td><em className={`status ${item.amount >= 0 ? "status-completed" : "status-failed"}`}>{item.amount >= 0 ? "افزایش اعتبار" : "مصرف"}</em></td><td className={item.amount >= 0 ? "transaction-positive" : "transaction-negative"}>{item.amount >= 0 ? "+" : "−"}{formatCredit(Math.abs(item.amount))}</td><td>{formatCredit(item.remainingCredit)}</td><td>{item.description || "—"}</td><td dir="ltr">{item.sendCode || "—"}</td></tr>)}
     </tbody></table></div><div className="pagination"><button disabled={page <= 1 || busy} onClick={() => load(page - 1)}>قبلی</button><span>صفحه {fa(page)} از {fa(pageCount)} · {fa(result.total)} تراکنش</span><button disabled={page >= pageCount || busy} onClick={() => load(page + 1)}>بعدی</button></div></section>
   </>;
 }

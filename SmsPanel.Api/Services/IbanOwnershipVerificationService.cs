@@ -9,7 +9,13 @@ namespace SmsPanel.Api.Services;
 public enum OwnershipCheckOutcome { Matched, Mismatched, Inconclusive }
 public sealed record OwnershipCheckResult(OwnershipCheckOutcome Outcome, string? AccountHolderName, string? Error = null);
 
-public sealed class IbanOwnershipVerificationService(BsiCardToIbanService bsi)
+public interface IIbanOwnershipVerificationService
+{
+    Task<(string? AccountHolderName, string? Error)> LookupOwnerAsync(string iban, CancellationToken token);
+    Task<OwnershipCheckResult> VerifyAsync(string iban, string expectedName, CancellationToken token);
+}
+
+public sealed class IbanOwnershipVerificationService(BsiCardToIbanService bsi) : IIbanOwnershipVerificationService
 {
     public async Task<(string? AccountHolderName, string? Error)> LookupOwnerAsync(string iban, CancellationToken token)
     {
@@ -81,9 +87,9 @@ public sealed class ExistingIbanOwnershipVerificationWorker(IServiceScopeFactory
         await Task.Delay(TimeSpan.FromSeconds(5), token);
         using var scope = scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SmsDbContext>();
-        var rows = await db.SecondaryBankAccounts
+        var rows = await db.SecondaryBankAccounts.AsNoTracking()
             .Where(x => x.OwnershipVerified != true && x.Iban.Length == 26 && x.Iban.Substring(4, 3) == "019")
-            .Join(db.People, account => account.PersonId, person => person.Id, (account, person) => new { Account = account, Person = person })
+            .Join(db.People.AsNoTracking(), account => account.PersonId, person => person.Id, (account, person) => new { Account = account, Person = person })
             .OrderBy(x => x.Account.OwnershipVerified == false ? 0 : 1).ThenBy(x => x.Account.Id).ToListAsync(token);
         var verifier = scope.ServiceProvider.GetRequiredService<IbanOwnershipVerificationService>();
         foreach (var row in rows)
@@ -95,24 +101,46 @@ public sealed class ExistingIbanOwnershipVerificationWorker(IServiceScopeFactory
                 log.LogWarning("استعلام مالکیت یکی از شباهای بانک صادرات قطعی نبود و بدون تغییر باقی ماند: {Reason}", result.Error);
                 continue;
             }
-            row.Account.OwnershipVerified = result.Outcome == OwnershipCheckOutcome.Matched;
-            var message = await db.InboundMessages.SingleAsync(x => x.Id == row.Account.InboundMessageId, token);
-            var ownershipIssues = await db.ReconciliationIssues.Where(x => x.InboundMessageId == message.Id && x.Status == IssueStatus.Open && x.IssueType == IssueType.AccountHolderNameMismatch).ToListAsync(token);
-            if (result.Outcome == OwnershipCheckOutcome.Matched)
-            {
-                foreach (var issue in ownershipIssues) { issue.Status = IssueStatus.Resolved; issue.ResolutionNote = "تطابق نام در بازبینی خودکار تأیید شد."; issue.ResolvedAtUtc = DateTimeOffset.UtcNow; }
-                if (ownershipIssues.Count > 0) { message.ProcessingStatus = ProcessingStatus.Processed; message.LastError = null; }
-            }
-            else
-            {
-                var reason = $"نام صاحب حساب اعلام‌شده توسط بانک با نام پذیرنده مطابقت ندارد. نام بانک: {result.AccountHolderName}؛ نام پذیرنده: {expectedName}.";
-                message.ProcessingStatus = ProcessingStatus.ReconciliationRequired; message.LastError = reason;
-                if (ownershipIssues.Count == 0)
-                    db.ReconciliationIssues.Add(new ReconciliationIssue { CampaignId = row.Account.CampaignId, InboundMessageId = message.Id, SenderMobile = message.SenderMobile, ExtractedIban = row.Account.Iban, IssueType = IssueType.AccountHolderNameMismatch, ResolutionNote = reason });
-                else foreach (var issue in ownershipIssues) issue.ResolutionNote = reason;
-            }
-            await db.SaveChangesAsync(token);
+            await SaveAuditResultAsync(db, row.Account, result, expectedName, token);
             await Task.Delay(TimeSpan.FromSeconds(2), token);
         }
+    }
+
+    private static Task SaveAuditResultAsync(SmsDbContext db, SecondaryBankAccount account, OwnershipCheckResult result,
+        string expectedName, CancellationToken token)
+    {
+        var verified = result.Outcome == OwnershipCheckOutcome.Matched;
+        return db.Database.CreateExecutionStrategy().ExecuteInTransactionAsync(
+            operation: async cancellationToken =>
+            {
+                db.ChangeTracker.Clear();
+                var changed = await db.SecondaryBankAccounts
+                    .Where(x => x.Id == account.Id && x.InboundMessageId == account.InboundMessageId
+                        && x.Iban == account.Iban && x.OwnershipVerified != true)
+                    .ExecuteUpdateAsync(updates => updates.SetProperty(x => x.OwnershipVerified, verified), cancellationToken);
+                if (changed == 0) return;
+
+                var message = await db.InboundMessages.SingleAsync(x => x.Id == account.InboundMessageId, cancellationToken);
+                var ownershipIssues = await db.ReconciliationIssues.Where(x => x.InboundMessageId == message.Id
+                    && x.Status == IssueStatus.Open && x.IssueType == IssueType.AccountHolderNameMismatch).ToListAsync(cancellationToken);
+                if (verified)
+                {
+                    foreach (var issue in ownershipIssues) { issue.Status = IssueStatus.Resolved; issue.ResolutionNote = "تطابق نام در بازبینی خودکار تأیید شد."; issue.ResolvedAtUtc = DateTimeOffset.UtcNow; }
+                    if (ownershipIssues.Count > 0) { message.ProcessingStatus = ProcessingStatus.Processed; message.LastError = null; }
+                }
+                else
+                {
+                    var reason = $"نام صاحب حساب اعلام‌شده توسط بانک با نام پذیرنده مطابقت ندارد. نام بانک: {result.AccountHolderName}؛ نام پذیرنده: {expectedName}.";
+                    message.ProcessingStatus = ProcessingStatus.ReconciliationRequired; message.LastError = reason;
+                    if (ownershipIssues.Count == 0)
+                        db.ReconciliationIssues.Add(new ReconciliationIssue { CampaignId = account.CampaignId, InboundMessageId = message.Id, SenderMobile = message.SenderMobile, ExtractedIban = account.Iban, IssueType = IssueType.AccountHolderNameMismatch, ResolutionNote = reason });
+                    else foreach (var issue in ownershipIssues) issue.ResolutionNote = reason;
+                }
+                await db.SaveChangesAsync(cancellationToken);
+            },
+            verifySucceeded: cancellationToken => db.SecondaryBankAccounts.AnyAsync(x => x.Id == account.Id
+                && x.InboundMessageId == account.InboundMessageId && x.Iban == account.Iban && x.OwnershipVerified == verified,
+                cancellationToken),
+            cancellationToken: token);
     }
 }

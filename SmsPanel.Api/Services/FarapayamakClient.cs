@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Net.Http.Json;
 using System.Xml.Linq;
@@ -17,9 +18,18 @@ public sealed record ProviderResponse(string Value, int RetStatus, string? StrRe
 }
 public sealed record ProviderInboundMessage(string Id, string Sender, string? Receiver, string Text, DateTimeOffset ReceivedAtUtc);
 public sealed record ProviderCreditTransaction(long Id, decimal Amount, decimal RemainingCredit, DateTimeOffset TransactedAtUtc, string? Description, int Type, long SendCode);
-public interface IFarapayamakClient { Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token); Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token); Task<decimal> GetCreditAsync(CancellationToken token); Task<IReadOnlyList<ProviderCreditTransaction>> GetCreditTransactionsAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken token); }
+public interface IFarapayamakClient
+{
+    Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token);
+    Task<IReadOnlyList<ProviderInboundMessage>> GetMessagesAsync(int index, int count, CancellationToken token);
+    Task<decimal> GetCreditAsync(CancellationToken token);
+    Task<IReadOnlyList<ProviderCreditTransaction>> GetCreditTransactionsAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken token);
+    Task<ProviderCreditTransaction?> GetLatestCreditTransactionAsync(CancellationToken token);
+}
 public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptions> settings, ILogger<FarapayamakClient> log, InboundTextDecoder textDecoder) : IFarapayamakClient
 {
+    private const int CreditTransactionBatchSize = 100;
+    public const int CreditTransactionLimit = 10_000;
     private readonly FarapayamakOptions o = settings.Value;
     public async Task<ProviderResponse> SendAsync(IReadOnlyCollection<string> recipients, string text, CancellationToken token)
     {
@@ -36,30 +46,60 @@ public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptio
     }
     public async Task<IReadOnlyList<ProviderCreditTransaction>> GetCreditTransactionsAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken token)
     {
-        const int batchSize = 100;
-        const int maximumRows = 10_000;
-        var result = new List<ProviderCreditTransaction>();
-        var serviceNamespace = XName.Get("GetUserTransactions2", "http://tempuri.org/").Namespace;
-        for (var index = 0; index < maximumRows; index += batchSize)
+        const int concurrentPages = 4;
+        var result = await GetCreditTransactionPageAsync(fromUtc, toUtc, 0, CreditTransactionBatchSize, token);
+        if (result.Count < CreditTransactionBatchSize) return result;
+
+        for (var index = CreditTransactionBatchSize; index < CreditTransactionLimit; index += CreditTransactionBatchSize * concurrentPages)
         {
-            var envelope = new XDocument(
-                new XElement(XName.Get("Envelope", "http://schemas.xmlsoap.org/soap/envelope/"),
-                    new XElement(XName.Get("Body", "http://schemas.xmlsoap.org/soap/envelope/"),
-                        new XElement(serviceNamespace + "GetUserTransactions2",
-                            new XElement(serviceNamespace + "username", o.Username), new XElement(serviceNamespace + "password", o.Password), new XElement(serviceNamespace + "targetUsername", o.Username),
-                            new XElement(serviceNamespace + "creditType", "All"), new XElement(serviceNamespace + "dateFrom", fromUtc.UtcDateTime.ToString("O")), new XElement(serviceNamespace + "dateTo", toUtc.UtcDateTime.ToString("O")),
-                            new XElement(serviceNamespace + "count", batchSize), new XElement(serviceNamespace + "index", index)))));
-            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.payamak-panel.com/post/users.asmx");
-            request.Headers.Add("SOAPAction", "\"http://tempuri.org/GetUserTransactions2\"");
-            request.Content = new StringContent(envelope.ToString(SaveOptions.DisableFormatting), System.Text.Encoding.UTF8, "text/xml");
-            using var response = await http.SendAsync(request, token);
-            response.EnsureSuccessStatusCode();
-            var document = XDocument.Parse(await response.Content.ReadAsStringAsync(token));
-            var rows = document.Descendants().Where(x => x.Name.LocalName == "CreditList").Select(ParseCreditTransaction).ToList();
-            result.AddRange(rows);
-            if (rows.Count < batchSize) break;
+            using var pending = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var pageCount = Math.Min(concurrentPages, (CreditTransactionLimit - index) / CreditTransactionBatchSize);
+            var pages = Enumerable.Range(0, pageCount)
+                .Select(page => GetCreditTransactionPageAsync(fromUtc, toUtc, index + page * CreditTransactionBatchSize, CreditTransactionBatchSize, pending.Token))
+                .ToArray();
+            try
+            {
+                foreach (var page in pages)
+                {
+                    var rows = await page;
+                    result.AddRange(rows);
+                    if (rows.Count < CreditTransactionBatchSize) return result;
+                }
+            }
+            finally
+            {
+                pending.Cancel();
+                await ((Task)Task.WhenAll(pages)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            }
         }
         return result;
+    }
+
+    public async Task<ProviderCreditTransaction?> GetLatestCreditTransactionAsync(CancellationToken token)
+    {
+        var rows = await GetCreditTransactionPageAsync(DateTimeOffset.UnixEpoch, DateTimeOffset.UtcNow, 0, 1, token);
+        return rows.FirstOrDefault();
+    }
+
+    private async Task<List<ProviderCreditTransaction>> GetCreditTransactionPageAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, int index, int count, CancellationToken token)
+    {
+        var serviceNamespace = XName.Get("GetUserTransactions2", "http://tempuri.org/").Namespace;
+        var soap = XNamespace.Get("http://schemas.xmlsoap.org/soap/envelope/");
+        var envelope = new XDocument(
+            new XElement(soap + "Envelope", new XElement(soap + "Body",
+                new XElement(serviceNamespace + "GetUserTransactions2",
+                    new XElement(serviceNamespace + "username", o.Username), new XElement(serviceNamespace + "password", o.Password), new XElement(serviceNamespace + "targetUsername", o.Username),
+                    new XElement(serviceNamespace + "creditType", "All"), new XElement(serviceNamespace + "dateFrom", fromUtc.UtcDateTime.ToString("O")), new XElement(serviceNamespace + "dateTo", toUtc.UtcDateTime.ToString("O")),
+                    new XElement(serviceNamespace + "count", count), new XElement(serviceNamespace + "index", index)))));
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.payamak-panel.com/post/users.asmx");
+        request.Headers.Add("SOAPAction", "\"http://tempuri.org/GetUserTransactions2\"");
+        request.Content = new StringContent(envelope.ToString(SaveOptions.DisableFormatting), System.Text.Encoding.UTF8, "text/xml");
+        using var response = await http.SendAsync(request, token);
+        response.EnsureSuccessStatusCode();
+        var document = XDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        var operation = document.Root?.Element(soap + "Body")?.Element(serviceNamespace + "GetUserTransactions2Response");
+        if (operation is null) throw new InvalidDataException("پاسخ گزارش فراپیامک ساختار مورد انتظار را ندارد.");
+        return operation.Descendants(serviceNamespace + "CreditList").Select(ParseCreditTransaction).ToList();
     }
 
     private static ProviderCreditTransaction ParseCreditTransaction(XElement row)
@@ -67,8 +107,8 @@ public sealed class FarapayamakClient(HttpClient http, IOptions<FarapayamakOptio
         string Value(string name) => row.Elements().FirstOrDefault(x => x.Name.LocalName == name)?.Value ?? string.Empty;
         return new ProviderCreditTransaction(
             long.Parse(Value("CreditID"), System.Globalization.CultureInfo.InvariantCulture),
-            decimal.Parse(Value("CreditAmount"), System.Globalization.CultureInfo.InvariantCulture),
-            decimal.Parse(Value("CreditRemain"), System.Globalization.CultureInfo.InvariantCulture),
+            decimal.Parse(Value("CreditAmount"), NumberStyles.Number | NumberStyles.AllowExponent, CultureInfo.InvariantCulture),
+            decimal.Parse(Value("CreditRemain"), NumberStyles.Number | NumberStyles.AllowExponent, CultureInfo.InvariantCulture),
             DateTimeOffset.Parse(Value("TransactDate"), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeLocal).ToUniversalTime(),
             string.IsNullOrWhiteSpace(Value("Description")) ? null : Value("Description").Trim(),
             int.Parse(Value("CreditType"), System.Globalization.CultureInfo.InvariantCulture),

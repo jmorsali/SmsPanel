@@ -18,21 +18,21 @@ public sealed class RefahCardToIbanService(IbanService ibans) : IDisposable
         var session = await BrowserSession.StartAsync(owner, cardNumber, token);
         try
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token); timeout.CancelAfter(TimeSpan.FromSeconds(40));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token); timeout.CancelAfter(TimeSpan.FromSeconds(65));
             var result = await session.DevTools.EvaluateAsync("""
                 (async () => {
                     const cardTab = [...document.querySelectorAll('[role=tab], a')].find(x => (x.textContent || '').trim() === 'شماره کارت');
                     cardTab?.click();
-                    const deadline = Date.now() + 20000;
+                    const deadline = Date.now() + 35000;
                     while (Date.now() < deadline) {
                         await new Promise(resolve => setTimeout(resolve, 120));
                         const image = document.querySelector('#ContentPlaceHolder1_CardCaptcha_CaptchaImageUP');
                         const fields = [1,2,3,4].map(i => document.querySelector('#ContentPlaceHolder1_getID' + i));
                         if (image?.src && image.complete && image.naturalWidth && fields.every(Boolean)) {
-                            const response = await fetch(image.src, { credentials: 'include', cache: 'no-store' });
-                            const blob = await response.blob();
-                            const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(blob); });
-                            return { image: dataUrl, error: '' };
+                            const canvas = document.createElement('canvas');
+                            canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+                            canvas.getContext('2d').drawImage(image, 0, 0);
+                            return { image: canvas.toDataURL('image/png'), error: '' };
                         }
                     }
                     return { image: '', error: 'captcha' };
@@ -112,7 +112,7 @@ public sealed class RefahCardToIbanService(IbanService ibans) : IDisposable
                 var start = new ProcessStartInfo(FindBrowser()) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
                 foreach (var arg in new[] { "--headless=new", "--disable-gpu", "--disable-extensions", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", "--user-data-dir=" + profile, FormUrl }) start.ArgumentList.Add(arg);
                 process = Process.Start(start) ?? throw new InvalidOperationException("مرورگر مخفی بانک رفاه اجرا نشد.");
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token); timeout.CancelAfter(TimeSpan.FromSeconds(35));
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token); timeout.CancelAfter(TimeSpan.FromSeconds(60));
                 var port = await WaitForPortAsync(profile, process, timeout.Token); var uri = await WaitForPageAsync(port, timeout.Token);
                 socket = new ClientWebSocket(); await socket.ConnectAsync(uri, timeout.Token); var session = new BrowserSession(owner, cardNumber, process, socket, profile); await session.DevTools.WaitForDocumentAsync(timeout.Token); return session;
             }
